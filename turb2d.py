@@ -103,10 +103,10 @@ class QGModel:
         # laplacian
         self.lap = -(self.kx2d**2+self.ky2d**2)
         # filtr Arbic 2003
-        if sp_filtr:
+        if self.sp_filtr:
             self._init_filter()
         else:
-            self.filtr = 1
+            self.filtr = cp.ones_like(self.kx2d)
 
         # preallocate for jacobian  for dealiasing
         self.Nxpad = int(3*self.Nx/2)
@@ -143,7 +143,7 @@ class QGModel:
         rv_hat = q_hat + self.gamma**2*p_hat
         jacobian_term = self.compute_jacobian(p_hat,q_hat)
         beta_term = self.beta*self.kx2d*1j*p_hat
-        damping_term = (-self.friction + (-1)^(n+1)*self.visc*(self.lap**(n)))*rv_hat
+        damping_term = (-self.friction + (-1)**(self.hyperorder+1)*self.visc*(self.lap**(self.hyperorder)))*rv_hat
         damping_term+=self.compute_leith_term()
         
         return -jacobian_term-beta_term+damping_term+self.force_q
