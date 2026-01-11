@@ -16,7 +16,7 @@ import os
 class QGModel:
     # 2d turbulence model
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
-                 beta=0, gamma=0, visc0=0,visc2=0,visc4=0,cl=0,forcing=None,wscale=4):
+                 beta=0, gamma=0, friction=0,visc=0,hyperorder=1,sp_filtr=False,cl=0,forcing=None,wscale=4):
         self.Nx = Nx
         self.Ny = Ny
         self.Lx = Lx
@@ -28,9 +28,10 @@ class QGModel:
         # parameter of qg
         self.beta = beta
         self.gamma = gamma
-        self.visc0 = visc0 # friction 
-        self.visc2 = visc2 # Newtanion
-        self.visc4 = visc4 # 2order Hyperviscosity
+        self.friction = friction # large scale friction 
+        self.visc = visc # viscosity
+        self.hyperorder = hyperorder # order of hyper viscosity, 1-> Newnation 2-> biharmonic ...
+        self.sp_filtr = sp_filtr # spectral filter impose on the tail of spectral (Arbic 2003)
         self.cl = cl #leith parameter
         self.forcing = forcing
         self.wscale = wscale # scale of wind
@@ -101,11 +102,12 @@ class QGModel:
         self.inversion[0,0] = 0.0
         # laplacian
         self.lap = -(self.kx2d**2+self.ky2d**2)
-        # laplacian of laplacian
-        self.lap2 = (self.kx2d**2+self.ky2d**2)**2 
         # filtr Arbic 2003
-        self._init_filter()
-        
+        if sp_filtr:
+            self._init_filter()
+        else:
+            self.filtr = 1
+
         # preallocate for jacobian  for dealiasing
         self.Nxpad = int(3*self.Nx/2)
         self.Nypad = int(3*self.Ny/2)
@@ -141,7 +143,7 @@ class QGModel:
         rv_hat = q_hat + self.gamma**2*p_hat
         jacobian_term = self.compute_jacobian(p_hat,q_hat)
         beta_term = self.beta*self.kx2d*1j*p_hat
-        damping_term = (-self.visc0 + self.visc2*self.lap - self.visc4*self.lap2)*rv_hat
+        damping_term = (-self.friction + (-1)^(n+1)*self.visc*(self.lap**(n)))*rv_hat
         damping_term+=self.compute_leith_term()
         
         return -jacobian_term-beta_term+damping_term+self.force_q
@@ -302,9 +304,8 @@ class QGModel:
         self.ds.Nx = self.Nx
         self.ds.Ny = self.Ny
         self.ds.k0 = self.k_peak
-        self.ds.visc0 = self.visc0
-        self.ds.visc2 = self.visc2
-        self.ds.visc4 = self.visc4
+        self.ds.friction = self.friction
+        self.ds.visc = self.visc
         self.ds.gamma = self.gamma
         self.ds.beta = self.beta
         self.ds.cl = self.cl
