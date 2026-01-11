@@ -1,4 +1,4 @@
-# %%
+
 import numpy as np
 import cupy as cp
 import cupyx.scipy.fft as cufft
@@ -39,7 +39,7 @@ class QGModel:
         self._prebuild_operator()
         self._my_div()
         # gpu or cpu?  backend
-
+###
     def _init_grid(self):
         self.x = cp.linspace(0,self.Lx,self.Nx)
         self.y = cp.linspace(0,self.Ly,self.Ny)
@@ -171,14 +171,13 @@ class QGModel:
         # initial potential vorticity (q)
         self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
         # normalize mean of total energy to 0.5
-        self.ene_kk, self.ens_kk, self.eneflux_kk, self.ensflux_kk, self.ene_tot, self.ens_tot = self.get_diag(self.p_hat,self.q_hat)
-        norm_fac = cp.sqrt(0.5/(self.ene_tot/(self.Nx*self.Ny)))
+        ene_tot = self.get_Etot(self.p_hat)
+        norm_fac = cp.sqrt(0.5/(ene_tot/(self.Nx*self.Ny)))
         self.p_hat = norm_fac*self.p_hat
         # initial relavitve vorticity (rv)
         self.rv_hat = self.lap*self.p_hat
         # initial potential vorticity (q)
         self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
-        self.ene_kk, self.ens_kk, self.eneflux_kk, self.ensflux_kk, self.ene_tot, self.ens_tot = self.get_diag(self.p_hat,self.q_hat)
         self.rv_hat = self.lap*self.p_hat
         self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
         
@@ -229,9 +228,8 @@ class QGModel:
             self.q_hat *=norm_fac
             self.p_hat = self.inversion*self.q_hat
             self.rv_hat = self.lap*self.p_hat
-        self.ene_kk, self.ens_kk, self.eneflux_kk, self.ensflux_kk, self.ene_tot, self.ens_tot = self.get_diag(self.p_hat,self.q_hat)
     # def upscale(self,Nxup,Nyup):
-    
+
     def _set_windforce(self):
         # graham 2013 and Frezat 2022
         phi_x = cp.pi*cp.sin(1.5*self.t)
@@ -248,32 +246,69 @@ class QGModel:
         # plt.imshow(ifft2(Fq_hat).real.get())
         # plt.colorbar()
         # plt.show()
-        
-
-    def get_diag(self,p_hat,q_hat):
-        jacobian_term = self.compute_jacobian(p_hat,q_hat)
-        # KE density in spectral space
+    
+## diagnostic term
+    def get_Ek(self,p_hat):
+        # Isotropic Energy spectrum
+        # Energy density in spectral space
         ene_dens = 0.5*self.kk**2*cp.abs(p_hat)**2
-        # Enstrophy density in spectral space
-        ens_dens = 0.5*np.abs(q_hat)**2
-        # KE flux tendency in spectral space
-        ene_flux = cp.real(cp.conj(p_hat)*jacobian_term)
-        # Enstrophy flux tendency in spectral space
-        ens_flux = -cp.real(cp.conj(q_hat)*jacobian_term)
-        # isotropic energy spectrum in physical space using Parseval's Theorem
+        # Physical space using Parseval's Theorem
         norm_fac = 1/(self.Nx*self.Ny)
         ene_kk = npg.aggregate(self.kk_idx.ravel().get(),ene_dens.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        ens_kk = npg.aggregate(self.kk_idx.ravel().get(),ens_dens.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # isotropic kinetic energy flux(tendency actually here) in physical space 
-        eneflux_kk = npg.aggregate(self.kk_idx.ravel().get(),ene_flux.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # isotropic enstrophy flux (tendency actually here) in physical space
-        ensflux_kk = npg.aggregate(self.kk_idx.ravel().get(),ens_flux.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # total energy in physical space using Parseval's Theorem
+        return ene_kk
+    def get_Etot(self,p_hat):
+        # Total Energy
+        ene_kk = self.get_Ek(p_hat)
         ene_tot = np.sum(ene_kk) 
-        ens_tot = np.sum(ens_kk) 
-        
-        return ene_kk, ens_kk, eneflux_kk, ensflux_kk, ene_tot, ens_tot
-        
+        return ene_tot
+    def get_Zk(self,q_hat):
+        # Enstrophy density in spectral space
+        ens_dens = 0.5*np.abs(q_hat)**2
+        norm_fac = 1/(self.Nx*self.Ny)
+        # isotropic enstrophy spectrum in physical space using Parseval's Theorem
+        ens_kk = npg.aggregate(self.kk_idx.ravel().get(),ens_dens.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        return ens_kk
+    def get_Ztot(self,q_hat):
+        # Total Enstrophy
+        enskk = self.get_Zk(q_hat)
+        ens_tot = np.sum(ens_kk)
+        return ens_tot
+
+    def get_diagNL(self,p_hat,q_hat):
+        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        # spectral energy transfer of non-linear advection
+        tenl = cp.real(cp.conj(p_hat)*jacobian_term)
+        # spectral enstrophy transfer of non-linear advection
+        tznl = -cp.real(cp.conj(q_hat)*jacobian_term)
+
+        # Isotropic spectrum of energy transfer of non-linear advection 
+        # In physical space 
+        norm_fac = 1/(self.Nx*self.Ny)
+        tenl_kk = npg.aggregate(self.kk_idx.ravel().get(),tenl.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of enstrophy transfer of non-linear advection
+        # In physical space 
+        tznl_kk = npg.aggregate(self.kk_idx.ravel().get(),tznl.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of energy flux of non-linear advection
+        fenl_kk = -np.cumsum(tenl_kk)
+        # Isotropic spectrum of energy flux of non-linear advection
+        fznl_kk = -np.cumsum(tznl_kk)
+
+        return tenl_kk, tznl_kk, fenl_kk, fznl_kk
+
+    def get_TENL(self,p_hat,q_hat):
+        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        # spectral energy transfer of non-linear advection
+        tenl = cp.real(cp.conj(p_hat)*jacobian_term)
+        return tenl
+    
+    def get_TZNL(self,p_hat,q_hat):
+        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        # spectral enstrophy transfer of non-linear advection
+        tznl = -cp.real(cp.conj(q_hat)*jacobian_term)
+        return tznl
+    
+    
+###   
     def create_nc(self,nf,savedir):
         outdir = "./%s"%(savedir)
         os.makedirs(outdir, exist_ok=True)
@@ -293,12 +328,14 @@ class QGModel:
         self.q_var = self.ds.createVariable('q', 'f8', ('time', 'x', 'y'), zlib=False)
         self.psi_var = self.ds.createVariable('psi', 'f8', ('time', 'x', 'y'), zlib=False)
         self.rv_var = self.ds.createVariable('rv', 'f8', ('time', 'x', 'y'), zlib=False)
-        self.ene_var = self.ds.createVariable('energy', 'f8', ('time',))
-        self.ens_var = self.ds.createVariable('enstrophy', 'f8', ('time',))
-        self.enespec_var = self.ds.createVariable('ene_spec', 'f8', ('time', 'k'), zlib=False)
-        self.ensspec_var = self.ds.createVariable('ens_spec', 'f8', ('time', 'k'), zlib=False)
-        self.eneflux_var = self.ds.createVariable('ene_flux', 'f8', ('time', 'k'), zlib=False)
-        self.ensflux_var = self.ds.createVariable('ens_flux', 'f8', ('time', 'k'), zlib=False)
+        self.Etot_var = self.ds.createVariable('Etot', 'f8', ('time',))
+        self.Ztot_var = self.ds.createVariable('Ztot', 'f8', ('time',))
+        self.Ek_var = self.ds.createVariable('Ek', 'f8', ('time', 'k'), zlib=False)
+        self.Zk_var = self.ds.createVariable('Zk', 'f8', ('time', 'k'), zlib=False)
+        self.tenlk_var = self.ds.createVariable('tenlk', 'f8', ('time', 'k'), zlib=False)
+        self.tznlk_var = self.ds.createVariable('tznlk', 'f8', ('time', 'k'), zlib=False)
+        self.fenlk_var = self.ds.createVariable('fenlk', 'f8', ('time', 'k'), zlib=False)
+        self.fznlk_var = self.ds.createVariable('fznlk', 'f8', ('time', 'k'), zlib=False)
         self.ds.description = "QG Turbulence Simulation"
         self.ds.dt = self.dt
         self.ds.Nx = self.Nx
@@ -312,7 +349,6 @@ class QGModel:
 
 
     def save_var(self,it):
-        self.ene_kk, self.ens_kk, self.eneflux_kk, self.ensflux_kk, self.ene_tot, self.ens_tot = self.get_diag(self.p_hat,self.q_hat)
         p_r = ifft2(self.p_hat).real.get()
         q_r = ifft2(self.q_hat).real.get()
         rv_r = ifft2(self.rv_hat).real.get()
@@ -320,12 +356,14 @@ class QGModel:
         self.q_var[it,:,:] = q_r
         self.psi_var[it,:,:] = p_r
         self.rv_var[it,:,:] = rv_r
-        self.ene_var[it] = self.ene_tot
-        self.ens_var[it] = self.ens_tot
-        self.enespec_var[it,:] = self.ene_kk
-        self.ensspec_var[it,:] = self.ens_kk
-        self.eneflux_var[it,:] = self.eneflux_kk
-        self.ensflux_var[it,:] = self.ensflux_kk
+        self.Etot_var[it] = self.get_Etot(self.p_hat)
+        self.Ztot_var[it] = self.get_Ztot(self.q_hat)
+        self.Ek_var[it,:] = self.get_Ek(self.p_hat) 
+        self.Zk_var[it,:] = self.get_Zk(self.q_hat) 
+        self.tenlk_var[it,:], 
+        self.tznlk_var[it,:],
+        self.fenlk_var[it,:],
+        self.fznlk_var[it,:], = self.get_diagNL(self.p_hat,self.q_hat)
         self.ds.sync()
         
     def plot_diag(self):
