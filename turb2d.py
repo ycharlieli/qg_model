@@ -14,6 +14,7 @@ import netCDF4 as nc
 import os
 
 class QGModel:
+    # 2d turbulence model
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
                  beta=0, gamma=0, visc0=0,visc2=0,visc4=0,cl=0,forcing=None,wscale=4):
         self.Nx = Nx
@@ -167,9 +168,9 @@ class QGModel:
         self.rv_hat = self.lap*self.p_hat
         # initial potential vorticity (q)
         self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
-        # normalize energy to 0.5
+        # normalize mean of total energy to 0.5
         self.ene_kk, self.ens_kk, self.eneflux_kk, self.ensflux_kk, self.ene_tot, self.ens_tot = self.get_diag(self.p_hat,self.q_hat)
-        norm_fac = cp.sqrt(0.5/self.ene_tot)
+        norm_fac = cp.sqrt(0.5/(self.ene_tot/(self.Nx*self.Ny)))
         self.p_hat = norm_fac*self.p_hat
         # initial relavitve vorticity (rv)
         self.rv_hat = self.lap*self.p_hat
@@ -249,31 +250,25 @@ class QGModel:
 
     def get_diag(self,p_hat,q_hat):
         jacobian_term = self.compute_jacobian(p_hat,q_hat)
-        # KE density
-        ene_dens = 0.5*self.kk**2*cp.abs(p_hat)**2/(self.Nx**2*self.Ny**2)
-        # Enstrophy density
-        ens_dens = 0.5*np.abs(q_hat)**2/(self.Nx**2*self.Ny**2)
-        # KE flux tendency
-        ene_flux = cp.real(cp.conj(p_hat)*jacobian_term)/(self.Nx**2*self.Ny**2)
-        # Enstrophy flux tendency 
-        ens_flux = -cp.real(cp.conj(q_hat)*jacobian_term)/(self.Nx**2*self.Ny**2)
-        # # isotropic energy spectrum
-        # ene_kk = npg.aggregate(self.kk_intvl.ravel().get(),ene_dens.ravel().get(),func='sum')[self.kk_range.get()]
-        # ens_kk = npg.aggregate(self.kk_intvl.ravel().get(),ens_dens.ravel().get(),func='sum')[self.kk_range.get()]
-        # # isotropic kinetic energy flux(tendency actually here)
-        # eneflux_kk = npg.aggregate(self.kk_intvl.ravel().get(),ene_flux.ravel().get(),func='sum')[self.kk_range.get()]
-        # # isotropic enstrophy flux (tendency actually here)
-        # ensflux_kk = npg.aggregate(self.kk_intvl.ravel().get(),ens_flux.ravel().get(),func='sum')[self.kk_range.get()]
-        # isotropic energy spectrum
-        ene_kk = npg.aggregate(self.kk_idx.ravel().get(),ene_dens.ravel().get(),func='sum')[self.kk_range.get()]
-        ens_kk = npg.aggregate(self.kk_idx.ravel().get(),ens_dens.ravel().get(),func='sum')[self.kk_range.get()]
-        # isotropic kinetic energy flux(tendency actually here)
-        eneflux_kk = npg.aggregate(self.kk_idx.ravel().get(),ene_flux.ravel().get(),func='sum')[self.kk_range.get()]
-        # isotropic enstrophy flux (tendency actually here)
-        ensflux_kk = npg.aggregate(self.kk_idx.ravel().get(),ens_flux.ravel().get(),func='sum')[self.kk_range.get()]
-        # total energy
-        ene_tot = np.sum(ene_kk)
-        ens_tot = np.sum(ens_kk)
+        # KE density in spectral space
+        ene_dens = 0.5*self.kk**2*cp.abs(p_hat)**2
+        # Enstrophy density in spectral space
+        ens_dens = 0.5*np.abs(q_hat)**2
+        # KE flux tendency in spectral space
+        ene_flux = cp.real(cp.conj(p_hat)*jacobian_term)
+        # Enstrophy flux tendency in spectral space
+        ens_flux = -cp.real(cp.conj(q_hat)*jacobian_term)
+        # isotropic energy spectrum in physical space using Parseval's Theorem
+        norm_fac = 1/(self.Nx*self.Ny)
+        ene_kk = npg.aggregate(self.kk_idx.ravel().get(),ene_dens.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        ens_kk = npg.aggregate(self.kk_idx.ravel().get(),ens_dens.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # isotropic kinetic energy flux(tendency actually here) in physical space 
+        eneflux_kk = npg.aggregate(self.kk_idx.ravel().get(),ene_flux.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # isotropic enstrophy flux (tendency actually here) in physical space
+        ensflux_kk = npg.aggregate(self.kk_idx.ravel().get(),ens_flux.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # total energy in physical space using Parseval's Theorem
+        ene_tot = np.sum(ene_kk) 
+        ens_tot = np.sum(ens_kk) 
         
         return ene_kk, ens_kk, eneflux_kk, ensflux_kk, ene_tot, ens_tot
         
