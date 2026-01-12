@@ -366,6 +366,22 @@ class QGModel:
         fzvisc_kk = -np.cumsum(tzvisc_kk)
         return tevisc_kk, tzvisc_kk, fevisc_kk, fzvisc_kk
 
+    def get_diagFilt(self,p_hat,q_hat):
+        filt_rate = (self.filtr - 1.) / self.dt
+        tefilt = -cp.real(cp.conj(p_hat) * filt_rate*q_hat)
+        tzfilt = cp.real(cp.conj(q_hat) * filt_rate*q_hat)
+        norm_fac = 1/(self.Nx*self.Ny)
+        # Isotropic spectrum of energy transfer of friction
+        # In physical space 
+        tefilt_kk = npg.aggregate(self.kk_idx.ravel().get(),tefilt.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of enstrophy transfer of friction
+        # In physical space 
+        tzfilt_kk = npg.aggregate(self.kk_idx.ravel().get(),tzfilt.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of energy flux of friction
+        fefilt_kk = -np.cumsum(tefilt_kk)
+        # Isotropic spectrum of enstrophy flux of friction
+        fzfilt_kk = -np.cumsum(tzfilt_kk)
+        return tefilt_kk, tzfilt_kk, fefilt_kk, fzfilt_kk
     
     
     
@@ -409,7 +425,9 @@ class QGModel:
         # viscosity
         self.tevisck_var = self.ds.createVariable('tevisck', 'f8', ('time', 'k'), zlib=False)
         self.tzvisck_var = self.ds.createVariable('tzvisck', 'f8', ('time', 'k'), zlib=False)
-
+        # filter
+        self.tefiltk_var = self.ds.createVariable('tefiltk', 'f8', ('time', 'k'), zlib=False)
+        self.tzfiltk_var = self.ds.createVariable('tzfiltk', 'f8', ('time', 'k'), zlib=False)
         ## flux budget
         # non-linear advection
         self.fenlk_var = self.ds.createVariable('fenlk', 'f8', ('time', 'k'), zlib=False)
@@ -419,10 +437,13 @@ class QGModel:
         self.fzfk_var = self.ds.createVariable('fzfk', 'f8', ('time', 'k'), zlib=False)
         # friction
         self.fefrick_var = self.ds.createVariable('fefrick', 'f8', ('time', 'k'), zlib=False)
-        self.fzfrick_var = self.ds.createVariable('fzfric', 'f8', ('time', 'k'), zlib=False)
+        self.fzfrick_var = self.ds.createVariable('fzfrick', 'f8', ('time', 'k'), zlib=False)
         # viscosity
         self.fevisck_var = self.ds.createVariable('fevisck', 'f8', ('time', 'k'), zlib=False)
         self.fzvisck_var = self.ds.createVariable('fzvisck', 'f8', ('time', 'k'), zlib=False)
+        # filter
+        self.fefiltk_var = self.ds.createVariable('fefiltk', 'f8', ('time', 'k'), zlib=False)
+        self.fzfiltk_var = self.ds.createVariable('fzfiltk', 'f8', ('time', 'k'), zlib=False)
 
         self.ds.description = "QG Turbulence Simulation"
         self.ds.dt = self.dt
@@ -459,6 +480,8 @@ class QGModel:
         self.tefrick_var[it,:], self.tzfrick_var[it,:],self.fefrick_var[it,:], self.fzfrick_var[it,:] = self.get_diagFric(self.p_hat,self.q_hat)
         # viscosity
         self.tevisck_var[it,:], self.tzvisck_var[it,:], self.fevisck_var[it,:], self.fzvisck_var[it,:] = self.get_diagVisc(self.p_hat,self.q_hat)
+        # filter
+        self.tefiltk_var[it,:], self.tzfiltk_var[it,:],self.fefiltk_var[it,:], self.fzfiltk_var[it,:] = self.get_diagFilt(self.p_hat,self.q_hat)
 
         self.ds.sync()
         
@@ -483,7 +506,7 @@ class QGModel:
         # C. Dissipation Terms (Calculated Separately)
         tevisc, _, fevisc, _ = self.get_diagVisc(self.p_hat, self.q_hat)
         tefric, _, fefric, _ = self.get_diagFric(self.p_hat, self.q_hat)
-
+        tefilt, _, fefilt, _ = self.get_diagFilt(self.p_hat, self.q_hat)
         # --- 2. Normalize to Mean (Density) ---
         # Current variables are "Total Sums". Divide by grid size to get "Mean per point".
         norm_fac = 1.0 / (self.Nx * self.Ny)
@@ -493,22 +516,24 @@ class QGModel:
         teF *= norm_fac
         tevisc *= norm_fac
         tefric *= norm_fac
+        tefilt *= norm_fac
         
         # Scale Fluxes
         fenl *= norm_fac
         feF *= norm_fac
         fevisc *= norm_fac
         fefric *= norm_fac
+        fefilt *= norm_fac
         
         # Scale Energy Spectrum
         Ek = Ek * norm_fac
 
         # D. Residuals (Should be ~0 in steady state)
         # Tendency Residual: dE/dt = NL + Forcing + Viscosity + Friction
-        te_sum = tenl + teF + tevisc + tefric
+        te_sum = tenl + teF + tevisc + tefric + tefilt
         
         # Flux Residual: Sum of cumulative fluxes
-        fe_sum = fenl + feF + fevisc + fefric
+        fe_sum = fenl + feF + fevisc + fefric + fefilt
 
         # --- 3. Setup Figure ---
         plt.rcParams.update({'font.size': 20})
@@ -539,7 +564,7 @@ class QGModel:
         # Panel 2: Energy Spectrum
         ax_spec.loglog(ks, Ek, color='tab:blue', linewidth=3, label='Energy Spec')
         # References
-        ref_k = np.array([3., 40.])
+        ref_k = np.array([3., 40.])/ np.pi / 2
         ax_spec.loglog(ref_k, 0.5 * ref_k**-3, 'k--', label='$k^{-3}$', alpha=0.6)
         ax_spec.loglog(ref_k, 0.1 * ref_k**-(5/3), 'k-.', label='$k^{-5/3}$', alpha=0.6)
         
@@ -556,6 +581,7 @@ class QGModel:
         ax_tendency.semilogx(ks, teF, label='Forcing', color='tab:green', linewidth=2.5)
         ax_tendency.semilogx(ks, tevisc, label='Viscosity', color='tab:orange', linewidth=2.5)
         ax_tendency.semilogx(ks, tefric, label='Friction', color='tab:red', linewidth=2.5)
+        ax_tendency.semilogx(ks, tefilt, label='Filter', color='tab:purple', linewidth=2.5)
         ax_tendency.semilogx(ks, te_sum, 'k--', label='Sum (Residual)', linewidth=1.5)
         
         ax_tendency.axhline(0, color='k', linestyle='-', linewidth=1.5)
@@ -571,6 +597,7 @@ class QGModel:
         ax_flux.semilogx(ks, feF, label='Forcing Flux', color='tab:green', linewidth=2.5)
         ax_flux.semilogx(ks, fevisc, label='Visc. Flux', color='tab:orange', linewidth=2.5)
         ax_flux.semilogx(ks, fefric, label='Fric. Flux', color='tab:red', linewidth=2.5)
+        ax_flux.semilogx(ks, fefilt, label='Filt. Flux', color='tab:purple', linewidth=2.5)
         ax_flux.semilogx(ks, fe_sum, 'k--', label='Sum (Residual)', linewidth=1.5)
 
         ax_flux.axhline(0, color='k', linestyle='-', linewidth=1.5)
