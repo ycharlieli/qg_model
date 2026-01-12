@@ -16,7 +16,7 @@ import os
 class QGModel:
     # 2d turbulence model
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
-                 beta=0, gamma=0, friction=0,visc=0,hyperorder=1,sp_filtr=False,cl=0,forcing=None,wscale=4):
+                 beta=0, gamma=0, friction=0,visc=0,hyperorder=1,sp_filtr=True,cl=0,forcing=None,wscale=4):
         self.Nx = Nx
         self.Ny = Ny
         self.Lx = Lx
@@ -386,9 +386,8 @@ class QGModel:
     
     
 ###   
-    def create_nc(self,nf,savedir):
-        outdir = "./%s"%(savedir)
-        os.makedirs(outdir, exist_ok=True)
+    def create_nc(self,nf):
+        outdir = self.savedir
         nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
         self.ds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
         time_dim = self.ds.createDimension('time', None) 
@@ -564,19 +563,23 @@ class QGModel:
         # Panel 2: Energy Spectrum
         ax_spec.loglog(ks, Ek, color='tab:blue', linewidth=3, label='Energy Spec')
         # References
-        ref_k = np.array([3., 40.])/ np.pi / 2
-        ax_spec.loglog(ref_k, 0.5 * ref_k**-3, 'k--', label='$k^{-3}$', alpha=0.6)
-        ax_spec.loglog(ref_k, 0.1 * ref_k**-(5/3), 'k-.', label='$k^{-5/3}$', alpha=0.6)
+        ks_direct = np.array([18., 80.])
+        ks_inv = np.array([5., 16.])
+        ax_spec.axvline(16, color='k', linestyle='--', linewidth=1.5, alpha=0.5)
+        ax_spec.loglog(ks_direct, 0.5 * ks_direct**-3, 'k--', label='$k^{-3}$', alpha=0.6)
+        ax_spec.loglog(ks_inv, 0.1 * ks_inv**-(5/3), 'k-.', label='$k^{-5/3}$', alpha=0.6)
         
         ax_spec.set_title('Isotropic KE Spectrum', fontweight='bold')
         ax_spec.set_xlabel('Wavenumber $k$')
         ax_spec.set_ylabel('$E(k)$')
         ax_spec.set_xlim([1, int(self.Nx/2)])
+        ax_spec.set_ylim([-5e-3, 1e-2])
         ax_spec.grid(True, which='both', linestyle='--', alpha=0.3)
         ax_spec.legend(loc='lower left', fontsize='small')
 
         # Panel 3: Energy Tendency Budget (Rate of Change)
         # Plots separate lines for Viscosity (High k) and Friction (Low k)
+        ax_tendency.axvline(16, color='k', linestyle='--', linewidth=1.5, alpha=0.5)
         ax_tendency.semilogx(ks, tenl, label='NL Transfer', color='tab:blue', linewidth=2.5)
         ax_tendency.semilogx(ks, teF, label='Forcing', color='tab:green', linewidth=2.5)
         ax_tendency.semilogx(ks, tevisc, label='Viscosity', color='tab:orange', linewidth=2.5)
@@ -593,6 +596,7 @@ class QGModel:
         ax_tendency.legend(fontsize='small', loc='best')
 
         # Panel 4: Energy Flux Budget (Cumulative Transfer)
+        ax_flux.axvline(16, color='k', linestyle='--', linewidth=1.5, alpha=0.5)
         ax_flux.semilogx(ks, fenl, label='NL Flux $\Pi_{NL}$', color='tab:blue', linewidth=2.5)
         ax_flux.semilogx(ks, feF, label='Forcing Flux', color='tab:green', linewidth=2.5)
         ax_flux.semilogx(ks, fevisc, label='Visc. Flux', color='tab:orange', linewidth=2.5)
@@ -615,14 +619,14 @@ class QGModel:
         else:
             plt.show()
 
-    def save_snapshot(self):
+    def save_snapshot(self,nstep):
         """Called inside run loop to save the diagnostic figure."""
         # Create directory
-        outdir = "./frames_output"
+        outdir = os.path.join(self.savedir, "figs")
         os.makedirs(outdir, exist_ok=True)
         
         # Save figure with time-stamp
-        filename = os.path.join(outdir, f"snap_t_{self.t:09.3f}.png")
+        filename = os.path.join(outdir, f"snap_t_{nstep:04d}.png")
         self.plot_diag(save_path=filename)
 
     def compute_jacobian(self,p_hat,q_hat):
@@ -668,6 +672,8 @@ class QGModel:
         self.tmax = tmax
         self.tsave = tsave
         self.t = 0     
+        self.savedir = savedir
+        os.makedirs(self.savedir, exist_ok=True)
         insave=nsave
         nf=0
 
@@ -675,7 +681,7 @@ class QGModel:
             if insave == nsave:
                 itsave =0 #time index
                 if nf > 0 : self.ds.close()
-                self.create_nc(nf,savedir)
+                self.create_nc(nf)
                 insave=0 #save number index
                 nf+=1
             if n%tsave == 0:
@@ -685,7 +691,8 @@ class QGModel:
                 itsave +=1
                 insave +=1
             if n%tplot ==0:
-                self.plot_diag() 
+                print(f"\t saving figure", end="\n")
+                self.save_snapshot(n) 
             
             self._step_forward()
             self.t += self.dt
