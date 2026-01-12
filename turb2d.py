@@ -350,9 +350,9 @@ class QGModel:
 
     def get_diagVisc(self, p_hat, q_hat):
         # spectral energy transfer of viscosity
-        tevisc = -cp.real(-visc*cp.conj(p_hat)*self.hylap*q_hat)
+        tevisc = -cp.real(cp.conj(p_hat)*self.hylap*q_hat) #TODO add parameterized term (Leith)
         # spectral enstrophy transfer of viscosity
-        tzvisc = cp.real(-visc*cp.conj(q_hat)*self.hylap*q_hat)
+        tzvisc = cp.real(cp.conj(q_hat)*self.hylap*q_hat)
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer of viscosity
         # In physical space 
@@ -363,8 +363,8 @@ class QGModel:
         # Isotropic spectrum of energy flux of friction
         fevisc_kk = -np.cumsum(tevisc_kk)
         # Isotropic spectrum of enstrophy flux of friction
-        fzfric_kk = -np.cumsum(tzvisc_kk)
-        return tefric_kk, tzfric_kk, fefric_kk, fzfric_kk
+        fzvisc_kk = -np.cumsum(tzvisc_kk)
+        return tevisc_kk, tzvisc_kk, fevisc_kk, fzvisc_kk
 
     
     
@@ -386,17 +386,44 @@ class QGModel:
         ys[:] = self.y.get()
         kk = self.ds.createVariable('k','f8',('k',))
         kk[:] = self.kk_iso.get()
+        ## prognostic variable
         self.q_var = self.ds.createVariable('q', 'f8', ('time', 'x', 'y'), zlib=False)
         self.psi_var = self.ds.createVariable('psi', 'f8', ('time', 'x', 'y'), zlib=False)
         self.rv_var = self.ds.createVariable('rv', 'f8', ('time', 'x', 'y'), zlib=False)
+        ## diagonistic variable
+        ## invariant quantities
         self.Etot_var = self.ds.createVariable('Etot', 'f8', ('time',))
         self.Ztot_var = self.ds.createVariable('Ztot', 'f8', ('time',))
         self.Ek_var = self.ds.createVariable('Ek', 'f8', ('time', 'k'), zlib=False)
         self.Zk_var = self.ds.createVariable('Zk', 'f8', ('time', 'k'), zlib=False)
+        ## tendency budget
+        # non-linear advection
         self.tenlk_var = self.ds.createVariable('tenlk', 'f8', ('time', 'k'), zlib=False)
         self.tznlk_var = self.ds.createVariable('tznlk', 'f8', ('time', 'k'), zlib=False)
+        # forcing 
+        self.tefk_var = self.ds.createVariable('tefk', 'f8', ('time', 'k'), zlib=False)
+        self.tzfk_var = self.ds.createVariable('tzfk', 'f8', ('time', 'k'), zlib=False)
+        # friction
+        self.tefrick_var = self.ds.createVariable('tefrick', 'f8', ('time', 'k'), zlib=False)
+        self.tzfrick_var = self.ds.createVariable('tzfrick', 'f8', ('time', 'k'), zlib=False)
+        # viscosity
+        self.tevisck_var = self.ds.createVariable('tevisck', 'f8', ('time', 'k'), zlib=False)
+        self.tzvisck_var = self.ds.createVariable('tzvisck', 'f8', ('time', 'k'), zlib=False)
+
+        ## flux budget
+        # non-linear advection
         self.fenlk_var = self.ds.createVariable('fenlk', 'f8', ('time', 'k'), zlib=False)
         self.fznlk_var = self.ds.createVariable('fznlk', 'f8', ('time', 'k'), zlib=False)
+        # forcing 
+        self.fefk_var = self.ds.createVariable('fefk', 'f8', ('time', 'k'), zlib=False)
+        self.fzfk_var = self.ds.createVariable('fzfk', 'f8', ('time', 'k'), zlib=False)
+        # friction
+        self.fefrick_var = self.ds.createVariable('fefrick', 'f8', ('time', 'k'), zlib=False)
+        self.fzfrick_var = self.ds.createVariable('fzfric', 'f8', ('time', 'k'), zlib=False)
+        # viscosity
+        self.fevisck_var = self.ds.createVariable('fevisck', 'f8', ('time', 'k'), zlib=False)
+        self.fzvisck_var = self.ds.createVariable('fzvisck', 'f8', ('time', 'k'), zlib=False)
+
         self.ds.description = "QG Turbulence Simulation"
         self.ds.dt = self.dt
         self.ds.Nx = self.Nx
@@ -414,48 +441,163 @@ class QGModel:
         q_r = ifft2(self.q_hat).real.get()
         rv_r = ifft2(self.rv_hat).real.get()
         self.times[it] = self.t
+        ## prognostic variable
         self.q_var[it,:,:] = q_r
         self.psi_var[it,:,:] = p_r
         self.rv_var[it,:,:] = rv_r
+        # diagnostic variable
+        # invariant quantities
         self.Etot_var[it] = self.get_Etot(self.p_hat)
         self.Ztot_var[it] = self.get_Ztot(self.q_hat)
         self.Ek_var[it,:] = self.get_Ek(self.p_hat) 
         self.Zk_var[it,:] = self.get_Zk(self.q_hat) 
-        self.tenlk_var[it,:], 
-        self.tznlk_var[it,:],
-        self.fenlk_var[it,:],
-        self.fznlk_var[it,:], = self.get_diagNL(self.p_hat,self.q_hat)
+        # tendency budget
+        self.tenlk_var[it,:],self.tznlk_var[it,:], self.fenlk_var[it,:], self.fznlk_var[it,:] = self.get_diagNL(self.p_hat,self.q_hat)
+        # forcing 
+        self.tefk_var[it,:], self.tzfk_var[it,:], self.fefk_var[it,:], self.fzfk_var[it,:] = self.get_diagF(self.p_hat,self.q_hat,self.force_q)
+        # friction 
+        self.tefrick_var[it,:], self.tzfrick_var[it,:],self.fefrick_var[it,:], self.fzfrick_var[it,:] = self.get_diagFric(self.p_hat,self.q_hat)
+        # viscosity
+        self.tevisck_var[it,:], self.tzvisck_var[it,:], self.fevisck_var[it,:], self.fzvisck_var[it,:] = self.get_diagVisc(self.p_hat,self.q_hat)
+
         self.ds.sync()
         
-    def plot_diag(self):
-        fig,axs = plt.subplots(1,5, figsize=(25,5),tight_layout=False)
-        cq=axs[0].imshow(ifft2(self.q_hat).real.get(),cmap=my_div,vmin=-40,vmax=40)
-        fig.colorbar(cq,ax=axs[0])
-        axs[0].set_title('$\zeta-\gamma^2\psi$')
-        cvor=axs[1].imshow(ifft2(self.rv_hat).real.get(),cmap=my_div,vmin=-40,vmax=40)
-        fig.colorbar(cvor,ax=axs[1])
-        axs[1].set_title('$\zeta$')
-        cp=axs[2].imshow(ifft2(self.p_hat).real.get(),cmap=my_div,vmin=-1,vmax=1)
-        fig.colorbar(cp,ax=axs[2])
-        fig.suptitle('time=%15.5fsec'%t)
-        axs[2].set_title('$\psi$')
+    def plot_diag(self, save_path=None):
+        """
+        Plots the current state and Energy budgets (Tendency and Flux).
+        Layout:
+          - Top (4x4): PV Field
+          - Bottom Left: Energy Spectrum
+          - Bottom Center: Energy Tendency Budget
+          - Bottom Right: Energy Flux Budget
+        """
+        # --- 1. Compute Diagnostics ---
+        Ek = self.get_Ek(self.p_hat)
         
-        axs[3].loglog(self.kk_iso.get(),self.ene_kk)
-        ks = np.array([3.,80])
-        es = 1e3*ks**-3
-        axs[3].loglog(ks,es,'k--')
-        es = 10*ks**-5
-        axs[3].loglog(ks,es,'k--')
-        axs[3].set_xlim([1,int(Nx/2)])
-        axs[3].set_ylim([1e-8,1])
-        axs[3].set_title('Energy Spectrum')
+        # A. Non-Linear Transfer & Flux
+        tenl, _, fenl, _ = self.get_diagNL(self.p_hat, self.q_hat)
+        
+        # B. Forcing (Injection) & Flux
+        teF, _, feF, _ = self.get_diagF(self.p_hat, self.q_hat, self.force_q)
+        
+        # C. Dissipation Terms (Calculated Separately)
+        tevisc, _, fevisc, _ = self.get_diagVisc(self.p_hat, self.q_hat)
+        tefric, _, fefric, _ = self.get_diagFric(self.p_hat, self.q_hat)
 
-        axs[4].plot(self.kk_iso.get(),self.eneflux_kk)
-        axs[4].set_xlim([1,int(Nx/2)])
-        axs[4].set_xscale('log')
-        axs[4].set_ylim([-2*1e-1,2*1e-1])
-        axs[4].set_title('KE flux')
+        # --- 2. Normalize to Mean (Density) ---
+        # Current variables are "Total Sums". Divide by grid size to get "Mean per point".
+        norm_fac = 1.0 / (self.Nx * self.Ny)
         
+        # Scale Tendencies
+        tenl *= norm_fac
+        teF *= norm_fac
+        tevisc *= norm_fac
+        tefric *= norm_fac
+        
+        # Scale Fluxes
+        fenl *= norm_fac
+        feF *= norm_fac
+        fevisc *= norm_fac
+        fefric *= norm_fac
+        
+        # Scale Energy Spectrum
+        Ek = Ek * norm_fac
+
+        # D. Residuals (Should be ~0 in steady state)
+        # Tendency Residual: dE/dt = NL + Forcing + Viscosity + Friction
+        te_sum = tenl + teF + tevisc + tefric
+        
+        # Flux Residual: Sum of cumulative fluxes
+        fe_sum = fenl + feF + fevisc + fefric
+
+        # --- 3. Setup Figure ---
+        plt.rcParams.update({'font.size': 20})
+        fig = plt.figure(figsize=(30, 18), tight_layout=True)
+        gs = fig.add_gridspec(6, 6)
+
+        # Assign Axes
+        ax_pv = fig.add_subplot(gs[0:4, 1:5])
+        ax_spec = fig.add_subplot(gs[4:, 0:2])
+        ax_tendency = fig.add_subplot(gs[4:, 2:4]) # Center Bottom
+        ax_flux = fig.add_subplot(gs[4:, 4:])      # Right Bottom
+
+        # --- 4. Plotting ---
+
+        # Panel 1: PV Field
+        q_phys = ifft2(self.q_hat).real.get()
+        im = ax_pv.imshow(q_phys, cmap=self.my_div, vmin=-3, vmax=3, 
+                          origin='lower', extent=[0, self.Lx, 0, self.Ly])
+        ax_pv.set_title(f'Potential Vorticity (t={self.t:.2f})', fontsize=30, fontweight='bold')
+        ax_pv.set_xlabel('x')
+        ax_pv.set_ylabel('y')
+        cbar = fig.colorbar(im, ax=ax_pv, shrink=0.8, aspect=30, pad=0.02)
+        cbar.set_label('PV')
+
+        # Common Wavenumber Axis 
+        ks = self.kk_iso.get() / np.pi / 2
+
+        # Panel 2: Energy Spectrum
+        ax_spec.loglog(ks, Ek, color='tab:blue', linewidth=3, label='Energy Spec')
+        # References
+        ref_k = np.array([3., 40.])
+        ax_spec.loglog(ref_k, 0.5 * ref_k**-3, 'k--', label='$k^{-3}$', alpha=0.6)
+        ax_spec.loglog(ref_k, 0.1 * ref_k**-(5/3), 'k-.', label='$k^{-5/3}$', alpha=0.6)
+        
+        ax_spec.set_title('Isotropic KE Spectrum', fontweight='bold')
+        ax_spec.set_xlabel('Wavenumber $k$')
+        ax_spec.set_ylabel('$E(k)$')
+        ax_spec.set_xlim([1, int(self.Nx/2)])
+        ax_spec.grid(True, which='both', linestyle='--', alpha=0.3)
+        ax_spec.legend(loc='lower left', fontsize='small')
+
+        # Panel 3: Energy Tendency Budget (Rate of Change)
+        # Plots separate lines for Viscosity (High k) and Friction (Low k)
+        ax_tendency.semilogx(ks, tenl, label='NL Transfer', color='tab:blue', linewidth=2.5)
+        ax_tendency.semilogx(ks, teF, label='Forcing', color='tab:green', linewidth=2.5)
+        ax_tendency.semilogx(ks, tevisc, label='Viscosity', color='tab:orange', linewidth=2.5)
+        ax_tendency.semilogx(ks, tefric, label='Friction', color='tab:red', linewidth=2.5)
+        ax_tendency.semilogx(ks, te_sum, 'k--', label='Sum (Residual)', linewidth=1.5)
+        
+        ax_tendency.axhline(0, color='k', linestyle='-', linewidth=1.5)
+        ax_tendency.set_xlim([1, int(self.Nx/2)])
+        ax_tendency.set_title('Energy Tendency Budget ($dE/dt$)', fontweight='bold')
+        ax_tendency.set_xlabel('Wavenumber $k$')
+        ax_tendency.set_ylabel('Rate')
+        ax_tendency.grid(True, which='both', linestyle='--', alpha=0.3)
+        ax_tendency.legend(fontsize='small', loc='best')
+
+        # Panel 4: Energy Flux Budget (Cumulative Transfer)
+        ax_flux.semilogx(ks, fenl, label='NL Flux $\Pi_{NL}$', color='tab:blue', linewidth=2.5)
+        ax_flux.semilogx(ks, feF, label='Forcing Flux', color='tab:green', linewidth=2.5)
+        ax_flux.semilogx(ks, fevisc, label='Visc. Flux', color='tab:orange', linewidth=2.5)
+        ax_flux.semilogx(ks, fefric, label='Fric. Flux', color='tab:red', linewidth=2.5)
+        ax_flux.semilogx(ks, fe_sum, 'k--', label='Sum (Residual)', linewidth=1.5)
+
+        ax_flux.axhline(0, color='k', linestyle='-', linewidth=1.5)
+        ax_flux.set_xlim([1, int(self.Nx/2)])
+        ax_flux.set_title('Energy Flux Budget ($\Pi_E$)', fontweight='bold')
+        ax_flux.set_xlabel('Wavenumber $k$')
+        ax_flux.set_ylabel('Flux')
+        ax_flux.grid(True, which='both', linestyle='--', alpha=0.3)
+        ax_flux.legend(fontsize='small', loc='best')
+
+        # --- 5. Save or Show ---
+        if save_path:
+            plt.savefig(save_path, dpi=100) # dpi=100 is fast for frames
+            plt.close(fig)
+        else:
+            plt.show()
+
+    def save_snapshot(self):
+        """Called inside run loop to save the diagnostic figure."""
+        # Create directory
+        outdir = "./frames_output"
+        os.makedirs(outdir, exist_ok=True)
+        
+        # Save figure with time-stamp
+        filename = os.path.join(outdir, f"snap_t_{self.t:09.3f}.png")
+        self.plot_diag(save_path=filename)
+
     def compute_jacobian(self,p_hat,q_hat):
         dxp_hat = self.kx2d*1j*p_hat
         dyp_hat = self.ky2d*1j*p_hat
@@ -495,10 +637,9 @@ class QGModel:
 
         return flux_x_hat+flux_y_hat
         
-    def run(self,tmax=40,tsave=200,nsave=100,savedir='run_0',tsnapshot=1000):
+    def run(self,tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0'):
         self.tmax = tmax
         self.tsave = tsave
-        self.tsnapshot = tsnapshot
         self.t = 0     
         insave=nsave
         nf=0
@@ -512,13 +653,13 @@ class QGModel:
                 nf+=1
             if n%tsave == 0:
                 self.save_var(itsave)
-                print(f"step {n:7d}  t = {self.t:9.6f} s  E = {self.get_Etot(self.p_hat):.4e}", end="\n")
+                print(f"step {n:7d}  t = {self.t:9.6f} s  E = {self.get_Etot(self.p_hat)/self.Nx/self.Ny:.4e}", end="\n")
+                # self.plot_diag()
                 itsave +=1
-                insave +=1 
-            # if n%tsnapshot == 0:
-            #     self.save_snapshot()
-                
-
+                insave +=1
+            if n%tplot ==0:
+                self.plot_diag() 
+            
             self._step_forward()
             self.t += self.dt
         self.ds.close()
