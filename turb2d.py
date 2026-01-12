@@ -59,8 +59,8 @@ class QGModel:
         # self.kk_set = cp.unique(self.kk_intvl) # isotropic wavenumber magnitude
         # self.kk_range  = self.kk_set < cp.sqrt(cp.min(cp.array([(self.kx2d**2).max(),(self.ky2d**2).max()])))
         # self.kk_iso = self.kk_set[self.kk_range]
-        self.kk_idx = cp.round(cp.sqrt(self.nx2d**2+self.ny2d**2)).astype('int')
-        self.kk_idx_set = cp.unique(self.kk_idx)
+        k_bins_grid = cp.round(cp.sqrt(self.nx2d**2 + self.ny2d**2)).astype('int')
+        self.kk_idx_set, self.kk_idx = cp.unique(k_bins_grid, return_inverse=True)
         self.kk_set = self.kk_idx_set * (2*cp.pi/self.Lx)
         self.kk_range = self.kk_idx_set < int(self.Nx/2)
         self.kk_iso = self.kk_set[self.kk_range]
@@ -102,6 +102,8 @@ class QGModel:
         self.inversion[0,0] = 0.0
         # laplacian
         self.lap = -(self.kx2d**2+self.ky2d**2)
+        # hyperlap for hyperviscosity
+        self.hylap = (-1)**(self.hyperorder+1)*self.visc*(self.lap**(self.hyperorder))
         # filtr Arbic 2003
         if self.sp_filtr:
             self._init_filter()
@@ -143,7 +145,7 @@ class QGModel:
         rv_hat = q_hat + self.gamma**2*p_hat
         jacobian_term = self.compute_jacobian(p_hat,q_hat)
         beta_term = self.beta*self.kx2d*1j*p_hat
-        damping_term = (-self.friction + (-1)**(self.hyperorder+1)*self.visc*(self.lap**(self.hyperorder)))*rv_hat
+        damping_term = (-self.friction + self.hylap)*rv_hat
         damping_term+=self.compute_leith_term()
         
         return -jacobian_term-beta_term+damping_term+self.force_q
@@ -228,6 +230,9 @@ class QGModel:
             self.q_hat *=norm_fac
             self.p_hat = self.inversion*self.q_hat
             self.rv_hat = self.lap*self.p_hat
+        self.Etot = self.get_Etot(self.p_hat)
+        self.Ek = self.get_Ek(self.p_hat)
+        self.tenlk, self.tznlk, self.fenlk, self.fznlk = self.get_diagNL(self.p_hat,self.q_hat)
     # def upscale(self,Nxup,Nyup):
 
     def _set_windforce(self):
@@ -270,9 +275,20 @@ class QGModel:
         return ens_kk
     def get_Ztot(self,q_hat):
         # Total Enstrophy
-        enskk = self.get_Zk(q_hat)
+        ens_kk = self.get_Zk(q_hat)
         ens_tot = np.sum(ens_kk)
         return ens_tot
+    def get_TENL(self,p_hat,q_hat):
+        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        # spectral energy transfer of non-linear advection
+        tenl = cp.real(cp.conj(p_hat)*jacobian_term)
+        return tenl
+    
+    def get_TZNL(self,p_hat,q_hat):
+        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        # spectral enstrophy transfer of non-linear advection
+        tznl = -cp.real(cp.conj(q_hat)*jacobian_term)
+        return tznl
 
     def get_diagNL(self,p_hat,q_hat):
         jacobian_term = self.compute_jacobian(p_hat,q_hat)
@@ -290,22 +306,67 @@ class QGModel:
         tznl_kk = npg.aggregate(self.kk_idx.ravel().get(),tznl.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of energy flux of non-linear advection
         fenl_kk = -np.cumsum(tenl_kk)
-        # Isotropic spectrum of energy flux of non-linear advection
+        # Isotropic spectrum of enstrophy flux of non-linear advection
         fznl_kk = -np.cumsum(tznl_kk)
 
         return tenl_kk, tznl_kk, fenl_kk, fznl_kk
 
-    def get_TENL(self,p_hat,q_hat):
-        jacobian_term = self.compute_jacobian(p_hat,q_hat)
-        # spectral energy transfer of non-linear advection
-        tenl = cp.real(cp.conj(p_hat)*jacobian_term)
-        return tenl
+    def get_diagF(self,p_hat,q_hat,force_q):
+        # spectral energy transfer of forcing
+        teF = -cp.real(cp.conj(p_hat)*force_q)
+        # spectral enstrophy transfoer of forcing
+        tzF = cp.real(cp.conj(q_hat)*force_q)
+        norm_fac = 1/(self.Nx*self.Ny)
+        # Isotropic spectrum of energy transfer of non-linear advection
+        # In physical space 
+        teF_kk = npg.aggregate(self.kk_idx.ravel().get(),teF.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of enstrophy transfer of non-linear advection
+        # In physical space 
+        tzF_kk =npg.aggregate(self.kk_idx.ravel().get(),tzF.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of energy flux of forcing
+        feF_kk = -np.cumsum(teF_kk)
+        # Isotropic spectrum of enstrophy flux of forcing
+        fzF_kk = -np.cumsum(tzF_kk)
+
+        return teF_kk, tzF_kk, feF_kk, fzF_kk
     
-    def get_TZNL(self,p_hat,q_hat):
-        jacobian_term = self.compute_jacobian(p_hat,q_hat)
-        # spectral enstrophy transfer of non-linear advection
-        tznl = -cp.real(cp.conj(q_hat)*jacobian_term)
-        return tznl
+    def get_diagFric(self,p_hat,q_hat):
+        # spectral energy transfer of friction
+        tefric = -2*self.friction* 0.5*self.kk**2*cp.abs(p_hat)**2
+        # spectral enstrophy transfer of friction
+        tzfric = -2*self.friction* 0.5*cp.abs(q_hat)**2
+        norm_fac = 1/(self.Nx*self.Ny)
+        # Isotropic spectrum of energy transfer of friction
+        # In physical space 
+        tefric_kk = npg.aggregate(self.kk_idx.ravel().get(),tefric.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of enstrophy transfer of friction
+        # In physical space 
+        tzfric_kk = npg.aggregate(self.kk_idx.ravel().get(),tzfric.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of energy flux of friction
+        fefric_kk = -np.cumsum(tefric_kk)
+        # Isotropic spectrum of enstrophy flux of friction
+        fzfric_kk = -np.cumsum(tzfric_kk)
+        return tefric_kk, tzfric_kk, fefric_kk, fzfric_kk
+
+    def get_diagVisc(self, p_hat, q_hat):
+        # spectral energy transfer of viscosity
+        tevisc = -cp.real(-visc*cp.conj(p_hat)*self.hylap*q_hat)
+        # spectral enstrophy transfer of viscosity
+        tzvisc = cp.real(-visc*cp.conj(q_hat)*self.hylap*q_hat)
+        norm_fac = 1/(self.Nx*self.Ny)
+        # Isotropic spectrum of energy transfer of viscosity
+        # In physical space 
+        tevisc_kk = npg.aggregate(self.kk_idx.ravel().get(),tevisc.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of enstrophy transfer of friction
+        # In physical space 
+        tzvisc_kk = npg.aggregate(self.kk_idx.ravel().get(),tzvisc.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of energy flux of friction
+        fevisc_kk = -np.cumsum(tevisc_kk)
+        # Isotropic spectrum of enstrophy flux of friction
+        fzfric_kk = -np.cumsum(tzvisc_kk)
+        return tefric_kk, tzfric_kk, fefric_kk, fzfric_kk
+
+    
     
     
 ###   
@@ -451,7 +512,7 @@ class QGModel:
                 nf+=1
             if n%tsave == 0:
                 self.save_var(itsave)
-                print(f"step {n:7d}  t = {self.t:9.6f} s  E = {self.ene_tot:.4e}", end="\n")
+                print(f"step {n:7d}  t = {self.t:9.6f} s  E = {self.get_Etot(self.p_hat):.4e}", end="\n")
                 itsave +=1
                 insave +=1 
             # if n%tsnapshot == 0:
