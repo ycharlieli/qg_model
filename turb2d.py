@@ -16,7 +16,7 @@ import os
 class QGModel:
     # 2d turbulence model
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
-                 beta=0, gamma=0, friction=0,visc=0,hyperorder=1,sp_filtr=True,cl=0,forcing=None,wscale=4):
+                 beta=0, gamma=0, friction=0,visc2 = 0,hyperorder=1,sp_filtr=False,cl=0,forcing=None,wscale=4,winput=3):
         self.Nx = Nx
         self.Ny = Ny
         self.Lx = Lx
@@ -29,12 +29,14 @@ class QGModel:
         self.beta = beta
         self.gamma = gamma
         self.friction = friction # large scale friction 
-        self.visc = visc # viscosity
+        self.visc2 = fisc2  #eddy viscosity
+        self.hyvisc = 1/(self.Nx)**(hyperorder*2) # viscosity
         self.hyperorder = hyperorder # order of hyper viscosity, 1-> Newnation 2-> biharmonic ...
         self.sp_filtr = sp_filtr # spectral filter impose on the tail of spectral (Arbic 2003)
         self.cl = cl #leith parameter
         self.forcing = forcing
         self.wscale = wscale # scale of wind
+        self.winput = winput # enstrophy injection rate of wind
         self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
         self._prebuild_operator()
         self._my_div()
@@ -103,7 +105,7 @@ class QGModel:
         # laplacian
         self.lap = -(self.kx2d**2+self.ky2d**2)
         # hyperlap for hyperviscosity
-        self.hylap = (-1)**(self.hyperorder+1)*self.visc*(self.lap**(self.hyperorder))
+        self.hylap = (-1)**(self.hyperorder+1)*self.hyvisc*(self.lap**(self.hyperorder))
         # filtr Arbic 2003
         if self.sp_filtr:
             self._init_filter()
@@ -145,7 +147,7 @@ class QGModel:
         rv_hat = q_hat + self.gamma**2*p_hat
         jacobian_term = self.compute_jacobian(p_hat,q_hat)
         beta_term = self.beta*self.kx2d*1j*p_hat
-        damping_term = (-self.friction + self.hylap)*rv_hat
+        damping_term = (-self.friction + self.visc2*self.lap+ self.hylap)*rv_hat
         damping_term+=self.compute_leith_term()
         
         return -jacobian_term-beta_term+damping_term+self.force_q
@@ -174,7 +176,7 @@ class QGModel:
         self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
         # normalize mean of total energy to 0.5
         ene_tot = self.get_Etot(self.p_hat)
-        norm_fac = cp.sqrt(0.5/(ene_tot/(self.Nx*self.Ny)))
+        norm_fac = cp.sqrt(self.eini/(ene_tot/(self.Nx*self.Ny)))
         self.p_hat = norm_fac*self.p_hat
         # initial relavitve vorticity (rv)
         self.rv_hat = self.lap*self.p_hat
@@ -183,7 +185,8 @@ class QGModel:
         self.rv_hat = self.lap*self.p_hat
         self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
         
-    def set_initial_condition(self,scheme='jcm1984',k_peak=6,krange=[3,5],ls=3,ss=-3,q_ini=None):
+    def set_initial_condition(self,scheme='jcm1984',k_peak=6,krange=[3,5],eini=0,ls=3,ss=-3,q_ini=None,):
+        self.eini = eini
         self.k_peak=k_peak
         if scheme == 'jcm1984':
             # kk**(-A)*(1 + (kk/k0)**4)**(-B)
@@ -213,10 +216,15 @@ class QGModel:
             rand_p[self.kk > krange[1]] = 0.0
             rand_p[0,0] = 0.0
             self.p_hat = rand_p.copy()
-            self._norm_energy()
+            if eini:
+                self._norm_energy()
         elif scheme == 'manual':
             # give initial q field manually
             self.q_hat = q_ini.copy()
+            self.p_hat = self.inversion*self.q_hat
+            self.rv_hat= self.lap*self.p_hat
+            if eini:
+                self._norm_energy()
         elif scheme == 'fromhr':
             fq_ini = fft2(cp.array(q_ini))
             hNx = q_ini.shape[0]
@@ -241,11 +249,8 @@ class QGModel:
         phi_y = cp.pi*cp.sin(1.4*self.t)
         Fq = cp.cos(self.wscale*self.y2d + phi_y) - cp.cos(self.wscale*self.x2d + phi_x) 
         Fq_hat = fft2(Fq)
-        Fq_hat[self.kk < 3.0] = 0.0
-        Fq_hat[self.kk > 5.0] = 0.0
-        Fq_hat[0, 0] = 0.0  # Zero mean
-        Fens_tot = 0.5 * cp.sum(cp.abs(Fq_hat)**2) / (self.Nx**2 * self.Ny**2)
-        norm_fac = cp.sqrt(3/Fens_tot)
+        inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection
+        norm_fac = 1.*(self.winput)/inputF
         Fq_hat *= norm_fac
         self.force_q = Fq_hat
         # plt.imshow(ifft2(Fq_hat).real.get())
@@ -350,9 +355,9 @@ class QGModel:
 
     def get_diagVisc(self, p_hat, q_hat):
         # spectral energy transfer of viscosity
-        tevisc = -cp.real(cp.conj(p_hat)*self.hylap*q_hat) #TODO add parameterized term (Leith)
+        tevisc = -cp.real(cp.conj(p_hat)*(self.visc2*self.lap+self.hylap)*q_hat) #TODO add parameterized term (Leith)
         # spectral enstrophy transfer of viscosity
-        tzvisc = cp.real(cp.conj(q_hat)*self.hylap*q_hat)
+        tzvisc = cp.real(cp.conj(q_hat)*(self.visc2*self.lap+self.hylap)*q_hat)
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer of viscosity
         # In physical space 
@@ -450,7 +455,7 @@ class QGModel:
         self.ds.Ny = self.Ny
         self.ds.k0 = self.k_peak
         self.ds.friction = self.friction
-        self.ds.visc = self.visc
+        self.ds.hyvisc = self.hyvisc
         self.ds.gamma = self.gamma
         self.ds.beta = self.beta
         self.ds.cl = self.cl
@@ -549,7 +554,7 @@ class QGModel:
 
         # Panel 1: PV Field
         q_phys = ifft2(self.q_hat).real.get()
-        im = ax_pv.imshow(q_phys, cmap=self.my_div, vmin=-3, vmax=3, 
+        im = ax_pv.imshow(q_phys, cmap=self.my_div,
                           origin='lower', extent=[0, self.Lx, 0, self.Ly])
         ax_pv.set_title(f'Potential Vorticity (t={self.t:.2f})', fontsize=30, fontweight='bold')
         ax_pv.set_xlabel('x')
@@ -558,14 +563,14 @@ class QGModel:
         cbar.set_label('PV')
 
         # Common Wavenumber Axis 
-        ks = self.kk_iso.get() / np.pi / 2
+        ks = self.kk_iso.get() /(2*cp.pi/self.Lx).get()
 
         # Panel 2: Energy Spectrum
         ax_spec.loglog(ks, Ek, color='tab:blue', linewidth=3, label='Energy Spec')
         # References
-        ks_direct = np.array([18., 80.])
-        ks_inv = np.array([5., 16.])
-        ax_spec.axvline(16, color='k', linestyle='--', linewidth=1.5, alpha=0.5)
+        ks_direct = np.array([18., 80.]) /(2*cp.pi/self.Lx).get()
+        ks_inv = np.array([5., 16.]) /(2*cp.pi/self.Lx).get()
+        ax_spec.axvline(self.wscale/(2*cp.pi/self.Lx).get(), color='k', linestyle='--', linewidth=1.5, alpha=0.5)
         ax_spec.loglog(ks_direct, 0.5 * ks_direct**-3, 'k--', label='$k^{-3}$', alpha=0.6)
         ax_spec.loglog(ks_inv, 0.1 * ks_inv**-(5/3), 'k-.', label='$k^{-5/3}$', alpha=0.6)
         
@@ -573,7 +578,7 @@ class QGModel:
         ax_spec.set_xlabel('Wavenumber $k$')
         ax_spec.set_ylabel('$E(k)$')
         ax_spec.set_xlim([1, int(self.Nx/2)])
-        ax_spec.set_ylim([-5e-3, 1e-2])
+        # ax_spec.set_ylim([-5e-3, 1e-2])
         ax_spec.grid(True, which='both', linestyle='--', alpha=0.3)
         ax_spec.legend(loc='lower left', fontsize='small')
 
@@ -668,7 +673,7 @@ class QGModel:
 
         return flux_x_hat+flux_y_hat
         
-    def run(self,tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0'):
+    def run(self,tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0',saveplot=True):
         self.tmax = tmax
         self.tsave = tsave
         self.t = 0     
@@ -687,7 +692,8 @@ class QGModel:
             if n%tsave == 0:
                 self.save_var(itsave)
                 print(f"step {n:7d}  t = {self.t:9.6f} s  E = {self.get_Etot(self.p_hat)/self.Nx/self.Ny:.4e}", end="\n")
-                # self.plot_diag()
+                if saveplot:
+                    self.plot_diag()
                 itsave +=1
                 insave +=1
             if n%tplot ==0:
