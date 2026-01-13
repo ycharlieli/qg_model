@@ -29,8 +29,8 @@ class QGModel:
         self.beta = beta
         self.gamma = gamma
         self.friction = friction # large scale friction 
-        self.visc2 = fisc2  #eddy viscosity
-        self.hyvisc = 1/(self.Nx)**(hyperorder*2) # viscosity
+        self.visc2 = visc2  #eddy viscosity
+        self.hyvisc = 1/(self.Nx*(2*cp.pi/self.Lx))**(hyperorder*2) # viscosity
         self.hyperorder = hyperorder # order of hyper viscosity, 1-> Newnation 2-> biharmonic ...
         self.sp_filtr = sp_filtr # spectral filter impose on the tail of spectral (Arbic 2003)
         self.cl = cl #leith parameter
@@ -200,6 +200,7 @@ class QGModel:
             self.p_hat = rand_p.copy()
             self._norm_energy()
         elif scheme =='thuburn':
+            # only valid for unit domain
             q_ini = cp.sin(8*cp.pi*self.x2d)*cp.sin(8*cp.pi*self.y2d)+ \
                      0.4*cp.cos(6*cp.pi*self.x2d)*cp.cos(6*cp.pi*self.y2d)+ \
                      0.3*cp.cos(10*cp.pi*self.x2d)*cp.cos(10*cp.pi*self.y2d)+\
@@ -245,6 +246,7 @@ class QGModel:
 
     def _set_windforce(self):
         # graham 2013 and Frezat 2022
+        # only valid for 2pi domain
         phi_x = cp.pi*cp.sin(1.5*self.t)
         phi_y = cp.pi*cp.sin(1.4*self.t)
         Fq = cp.cos(self.wscale*self.y2d + phi_y) - cp.cos(self.wscale*self.x2d + phi_x) 
@@ -563,14 +565,14 @@ class QGModel:
         cbar.set_label('PV')
 
         # Common Wavenumber Axis 
-        ks = self.kk_iso.get() /(2*cp.pi/self.Lx).get()
+        ks = self.kk_iso.get() /(2*cp.pi/self.Lx)
 
         # Panel 2: Energy Spectrum
         ax_spec.loglog(ks, Ek, color='tab:blue', linewidth=3, label='Energy Spec')
         # References
-        ks_direct = np.array([18., 80.]) /(2*cp.pi/self.Lx).get()
-        ks_inv = np.array([5., 16.]) /(2*cp.pi/self.Lx).get()
-        ax_spec.axvline(self.wscale/(2*cp.pi/self.Lx).get(), color='k', linestyle='--', linewidth=1.5, alpha=0.5)
+        ks_direct = np.array([18., 80.]) /(2*cp.pi/self.Lx)
+        ks_inv = np.array([5., 16.]) /(2*cp.pi/self.Lx)
+        ax_spec.axvline(self.wscale/(2*cp.pi/self.Lx), color='k', linestyle='--', linewidth=1.5, alpha=0.5)
         ax_spec.loglog(ks_direct, 0.5 * ks_direct**-3, 'k--', label='$k^{-3}$', alpha=0.6)
         ax_spec.loglog(ks_inv, 0.1 * ks_inv**-(5/3), 'k-.', label='$k^{-5/3}$', alpha=0.6)
         
@@ -631,7 +633,7 @@ class QGModel:
         os.makedirs(outdir, exist_ok=True)
         
         # Save figure with time-stamp
-        filename = os.path.join(outdir, f"snap_t_{nstep:04d}.png")
+        filename = os.path.join(outdir, f"snap_{nstep:04d}.png")
         self.plot_diag(save_path=filename)
 
     def compute_jacobian(self,p_hat,q_hat):
@@ -673,7 +675,7 @@ class QGModel:
 
         return flux_x_hat+flux_y_hat
         
-    def run(self,tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0',saveplot=True):
+    def run(self,tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0',saveplot=False):
         self.tmax = tmax
         self.tsave = tsave
         self.t = 0     
@@ -698,7 +700,7 @@ class QGModel:
                 insave +=1
             if n%tplot ==0:
                 print(f"\t saving figure", end="\n")
-                self.save_snapshot(n) 
+                self.save_snapshot(itsave) 
             
             self._step_forward()
             self.t += self.dt
