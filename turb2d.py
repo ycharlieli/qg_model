@@ -16,7 +16,9 @@ import os
 class QGModel:
     # 2d turbulence model
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
-                 beta=0, gamma=0, friction=0,visc2 = 0,hyperorder=1,sp_filtr=False,cl=0,forcing=None,wscale=4,winput=3):
+                 beta=0, gamma=0, 
+                 friction=0,visc2 = 0,hyperorder=1,sp_filtr=False,cl=0,
+                 forcing=None,fscale=4,finput=3,famp=1.):
         self.Nx = Nx
         self.Ny = Ny
         self.Lx = Lx
@@ -35,8 +37,9 @@ class QGModel:
         self.sp_filtr = sp_filtr # spectral filter impose on the tail of spectral (Arbic 2003)
         self.cl = cl #leith parameter
         self.forcing = forcing
-        self.wscale = wscale # scale of wind
-        self.winput = winput # enstrophy injection rate of wind
+        self.fscale = fscale # scale of wind
+        self.finput = finput # enstrophy injection rate of wind
+        self.famp = famp
         self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
         self._prebuild_operator()
         self._my_div()
@@ -66,7 +69,12 @@ class QGModel:
         self.kk_set = self.kk_idx_set * (2*cp.pi/self.Lx)
         self.kk_range = self.kk_idx_set < int(self.Nx/2)
         self.kk_iso = self.kk_set[self.kk_range]
-        
+    def _init_friction(self,k_friction=4):
+        # Only apply drag to large-scale modes (k <= 4) to stop the condensate
+        self.friction_mask = cp.zeros_like(self.kk)
+        self.friction_mask[self.kk <= k_friction] = 1
+        self.friction_mask[0,0] = 1 # Handle mean flow
+
     def _init_filter(self):
         #"""Set up frictional filter (Arbic and Flierl, 2004)."""
         # 1. Define Grid Spacing (dx, dy)
@@ -112,6 +120,10 @@ class QGModel:
         else:
             self.filtr = cp.ones_like(self.kx2d)
 
+        if self.forcing == 'markov':
+            self._init_markovforce(famp=self.famp)
+        
+        self._init_friction()
         # preallocate for jacobian  for dealiasing
         self.Nxpad = int(3*self.Nx/2)
         self.Nypad = int(3*self.Ny/2)
@@ -143,21 +155,24 @@ class QGModel:
 
         
     def _get_rhs(self,q_hat):
-        p_hat = self.inversion*q_hat
-        rv_hat = q_hat + self.gamma**2*p_hat
-        jacobian_term = self.compute_jacobian(p_hat,q_hat)
-        beta_term = self.beta*self.kx2d*1j*p_hat
-        damping_term = (-self.friction + self.visc2*self.lap+ self.hylap)*rv_hat
-        damping_term+=self.compute_leith_term()
-        
-        return -jacobian_term-beta_term+damping_term+self.force_q
-
-    def _step_forward(self):
         # based on rk4
         if self.forcing == 'wind':
             self._set_windforce()
         elif self.forcing =='thuburn':
             self.force_q = fft2(0.1*cp.sin(32*np.pi*self.x2d))
+        elif self.forcing == 'markov':
+            self._update_markovforce()
+        p_hat = self.inversion*q_hat
+        rv_hat = q_hat + self.gamma**2*p_hat
+        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        beta_term = self.beta*self.kx2d*1j*p_hat
+        damping_term = (-self.friction_mask*self.friction + self.visc2*self.lap+ self.hylap)*rv_hat
+        damping_term+=self.compute_leith_term()
+        
+        return -jacobian_term-beta_term+damping_term+self.force_q
+
+    def _step_forward(self):
+        
         q = self.q_hat
 
         k1 = self._get_rhs(q)
@@ -170,27 +185,92 @@ class QGModel:
         self.p_hat = self.inversion*self.q_hat
         self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
         
-    def _norm_energy(self):
-        self.rv_hat = self.lap*self.p_hat
-        # initial potential vorticity (q)
-        self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
-        # normalize mean of total energy to 0.5
-        ene_tot = self.get_Etot(self.p_hat)
-        norm_fac = cp.sqrt(self.eini/(ene_tot/(self.Nx*self.Ny)))
-        self.p_hat = norm_fac*self.p_hat
-        # initial relavitve vorticity (rv)
-        self.rv_hat = self.lap*self.p_hat
-        # initial potential vorticity (q)
-        self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
-        self.rv_hat = self.lap*self.p_hat
-        self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
+    
+    # def upscale(self,Nxup,Nyup):
+
+    def _set_windforce(self):
+        # graham 2013 and Frezat 2022
+        # only valid for 2pi domain
+        phi_x = cp.pi*cp.sin(1.5*self.t)
+        phi_y = cp.pi*cp.sin(1.4*self.t)
+        Fq = cp.cos(self.fscale*self.y2d + phi_y) - cp.cos(self.fscale*self.x2d + phi_x)  # original frezat& graham
+        # Fq = cp.sin(self.fscale*self.y2d )  # horizontal shear
+        Fq_hat = fft2(Fq)
         
-    def set_initial_condition(self,scheme='jcm1984',k_peak=6,krange=[3,5],eini=0,ls=3,ss=-3,q_ini=None,):
+        inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
+        # inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2
+        norm_fac = 1.*(self.finput)/(inputF+1e-16)
+        Fq_hat *= norm_fac
+        self.force_q = Fq_hat
+        
+        # plt.imshow(ifft2(Fq_hat).real.get())
+        # plt.colorbar()
+        # plt.show()
+    
+    def _init_markovforce(self, famp=1.0, t_r=0.5):
+        # markovian forcing 
+        # from Maltrud and Vallis 1991
+        k_min = self.fscale-2
+        k_max = self.fscale+2
+        # arkov Coefficient R 
+        # R depends on the timestep dt and correlation time t_r
+        # If t_r = 0, R = 0 (White Noise). 
+        if t_r == 0:
+            self.fR = 0.0
+        else:
+            self.fR = cp.exp(-self.dt / t_r)
+        
+        #  Pre-calculate the amplitude coefficient: A * sqrt(1 - R^2)
+        # This ensures the variance of the forcing stays constant at A^2 over time.
+        self.fcoef = famp * cp.sqrt(1 - self.fR**2)
+        
+        #  Create the Spectral Mask
+        #  forcing only to a specific wavenumber shell.
+        self.fmask = cp.zeros_like(self.kk)
+        
+        # Select wavenumbers inside the shell
+        idx = (self.kk >= k_min) & (self.kk <= k_max)
+        self.fmask[idx] = 1.0
+        
+        # Ensure the mean (k=0) is never forced
+        self.fmask[0, 0] = 0.0
+        
+        # Initialize the forcing field F_{n-1} to zero
+        self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
+
+    def _update_markovforce(self):
+        #  Generate Random Noise (ei\theta)
+        noise_phys = cp.random.randn(self.Nx, self.Ny)
+        noise_hat = fft2(noise_phys)
+        
+        #  Apply Spectral Mask
+        noise_hat *= self.fmask
+        
+        #  Markov Update 
+        # self.force_q currently holds F_{n-1}
+        self.force_q = (self.fcoef * noise_hat) + (self.fR * self.force_q)
+
+    def _norm_energy(self):
+            self.rv_hat = self.lap*self.p_hat
+            # initial potential vorticity (q)
+            self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
+            # normalize mean of total energy to 0.5
+            ene_tot = self.get_Etot(self.p_hat)
+            norm_fac = cp.sqrt(self.eini/(ene_tot/(self.Nx*self.Ny)))
+            self.p_hat = norm_fac*self.p_hat
+            # initial relavitve vorticity (rv)
+            self.rv_hat = self.lap*self.p_hat
+            # initial potential vorticity (q)
+            self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
+        
+    def set_initial_condition(self,scheme='gauss',eini=0,q_ini=None,):
         self.eini = eini
-        self.k_peak=k_peak
         if scheme == 'jcm1984':
+            k_peak = 6
             # kk**(-A)*(1 + (kk/k0)**4)**(-B)
             # generate Fourier conponent of initial streamfunction field
+            ls=3
+            ss=-3
             A = 3-ls
             B = (3-ss-A)/4
             amp = cp.sqrt(self.kk**(-A)*(1 + (self.kk/self.k_peak)**4)**(-B))
@@ -212,16 +292,19 @@ class QGModel:
             # self._norm_energy()
 
         elif scheme == 'gauss':
-            rand_p = fft2(cp.random.randn(*self.kk.shape))
-            rand_p[self.kk < krange[0]] = 0.0
-            rand_p[self.kk > krange[1]] = 0.0
+            psi_phys = cp.random.randn(self.Nx, self.Ny)
+            rand_p = fft2(psi_phys)
+            
+            rand_p[self.kk <= 4] = 0.0
+            rand_p[self.kk >= 8] = 0.0
             rand_p[0,0] = 0.0
             self.p_hat = rand_p.copy()
+            
             if eini:
                 self._norm_energy()
-            self.rv_hat = self.lap*self.p_hat
-            # initial potential vorticity (q)
-            self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
+                
+            self.rv_hat = self.lap * self.p_hat
+            self.q_hat = self.rv_hat - self.gamma**2 * self.p_hat
         elif scheme == 'manual':
             # give initial q field manually
             self.q_hat = q_ini.copy()
@@ -244,26 +327,7 @@ class QGModel:
             self.rv_hat = self.lap*self.p_hat
         self.Etot = self.get_Etot(self.p_hat)
         self.Ek = self.get_Ek(self.p_hat)
-        self.tenlk, self.tznlk, self.fenlk, self.fznlk = self.get_diagNL(self.p_hat,self.q_hat)
-    # def upscale(self,Nxup,Nyup):
-
-    def _set_windforce(self):
-        # graham 2013 and Frezat 2022
-        # only valid for 2pi domain
-        phi_x = 0#cp.pi*cp.sin(1.5*self.t)
-        phi_y = 0#cp.pi*cp.sin(1.4*self.t)
-        Fq = cp.cos(self.wscale*self.y2d + phi_y) - cp.cos(self.wscale*self.x2d + phi_x)  # original frezat& graham
-        # Fq = cp.sin(self.wscale*self.y2d )  # horizontal shear
-        Fq_hat = fft2(Fq)
-        #inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
-        inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2
-        norm_fac = 1.*(self.winput)/inputF
-        Fq_hat *= norm_fac
-        self.force_q = Fq_hat
-        # plt.imshow(ifft2(Fq_hat).real.get())
-        # plt.colorbar()
-        # plt.show()
-    
+        self.tenlk, self.tznlk, self.fenlk, self.fznlk = self.get_diagNL(self.p_hat,self.q_hat)    
 ## diagnostic term
     def get_Ek(self,p_hat):
         # Isotropic Energy spectrum
@@ -344,9 +408,9 @@ class QGModel:
     
     def get_diagFric(self,p_hat,q_hat):
         # spectral energy transfer of friction
-        tefric = -2*self.friction* 0.5*self.kk**2*cp.abs(p_hat)**2
+        tefric = -2*self.friction_mask*self.friction* 0.5*self.kk**2*cp.abs(p_hat)**2
         # spectral enstrophy transfer of friction
-        tzfric = -2*self.friction* 0.5*cp.abs(q_hat)**2
+        tzfric = -2*self.friction_mask*self.friction* 0.5*cp.abs(q_hat)**2
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer of friction
         # In physical space 
@@ -462,9 +526,9 @@ class QGModel:
         self.ds.Ny = self.Ny
         self.ds.Lx = self.Lx
         self.ds.Ly = self.Ly
-        self.ds.kf = self.wscale
-        self.ds.k0 = self.k_peak
+        self.ds.kf = self.fscale
         self.ds.friction = self.friction
+        self.ds.visc2 = self.visc2
         self.ds.hyvisc = self.hyvisc
         self.ds.gamma = self.gamma
         self.ds.beta = self.beta
@@ -566,7 +630,7 @@ class QGModel:
 
         # Panel 1: PV Field
         q_phys = ifft2(self.q_hat).real.get()
-        im = ax_pv.imshow(q_phys, cmap=self.my_div, vmin=-30,vmax=30,
+        im = ax_pv.imshow(q_phys, cmap=self.my_div,
                           extent=[0, self.Lx, 0, self.Ly])
         ax_pv.set_title(f'Potential Vorticity (t={self.t:.2f})', fontsize=30, fontweight='bold')
         ax_pv.set_xlabel('x')
@@ -582,7 +646,7 @@ class QGModel:
         # References
         ks_direct = np.array([18., 80.]) /(2*cp.pi/self.Lx)
         ks_inv = np.array([5., 16.]) /(2*cp.pi/self.Lx)
-        ax_spec.axvline(self.wscale/(2*cp.pi/self.Lx), color='k', linestyle='--', linewidth=1.5, alpha=0.5)
+        ax_spec.axvline(self.fscale/(2*cp.pi/self.Lx), color='k', linestyle='--', linewidth=1.5, alpha=0.5)
         ax_spec.loglog(ks_direct, 0.5 * ks_direct**-3, 'k--', label='$k^{-3}$', alpha=0.6)
         ax_spec.loglog(ks_inv, 0.1 * ks_inv**-(5/3), 'k-.', label='$k^{-5/3}$', alpha=0.6)
         
