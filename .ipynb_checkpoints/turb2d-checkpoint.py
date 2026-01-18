@@ -30,7 +30,7 @@ class QGModel:
         self.gamma = gamma
         self.friction = friction # large scale friction 
         self.visc2 = visc2  #eddy viscosity
-        self.hyvisc = 10*1/(self.Nx*(2*cp.pi/self.Lx))**(hyperorder*2) # viscosity
+        self.hyvisc = 100*1/(self.Nx*(2*cp.pi/self.Lx))**(hyperorder*2) # viscosity
         self.hyperorder = hyperorder # order of hyper viscosity, 1-> Newnation 2-> biharmonic ...
         self.sp_filtr = sp_filtr # spectral filter impose on the tail of spectral (Arbic 2003)
         self.cl = cl #leith parameter
@@ -219,6 +219,9 @@ class QGModel:
             self.p_hat = rand_p.copy()
             if eini:
                 self._norm_energy()
+            self.rv_hat = self.lap*self.p_hat
+            # initial potential vorticity (q)
+            self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
         elif scheme == 'manual':
             # give initial q field manually
             self.q_hat = q_ini.copy()

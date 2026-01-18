@@ -219,6 +219,9 @@ class QGModel:
             self.p_hat = rand_p.copy()
             if eini:
                 self._norm_energy()
+            self.rv_hat = self.lap*self.p_hat
+            # initial potential vorticity (q)
+            self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
         elif scheme == 'manual':
             # give initial q field manually
             self.q_hat = q_ini.copy()
@@ -247,11 +250,13 @@ class QGModel:
     def _set_windforce(self):
         # graham 2013 and Frezat 2022
         # only valid for 2pi domain
-        phi_x = cp.pi*cp.sin(1.5*self.t)
-        phi_y = cp.pi*cp.sin(1.4*self.t)
-        Fq = cp.cos(self.wscale*self.y2d + phi_y) - cp.cos(self.wscale*self.x2d + phi_x) 
+        phi_x = 0#cp.pi*cp.sin(1.5*self.t)
+        phi_y = 0#cp.pi*cp.sin(1.4*self.t)
+        Fq = cp.cos(self.wscale*self.y2d + phi_y) - cp.cos(self.wscale*self.x2d + phi_x)  # original frezat& graham
+        # Fq = cp.sin(self.wscale*self.y2d )  # horizontal shear
         Fq_hat = fft2(Fq)
-        inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection
+        #inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
+        inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2
         norm_fac = 1.*(self.winput)/inputF
         Fq_hat *= norm_fac
         self.force_q = Fq_hat
@@ -561,7 +566,7 @@ class QGModel:
 
         # Panel 1: PV Field
         q_phys = ifft2(self.q_hat).real.get()
-        im = ax_pv.imshow(q_phys, cmap=self.my_div, 
+        im = ax_pv.imshow(q_phys, cmap=self.my_div, vmin=-30,vmax=30,
                           extent=[0, self.Lx, 0, self.Ly])
         ax_pv.set_title(f'Potential Vorticity (t={self.t:.2f})', fontsize=30, fontweight='bold')
         ax_pv.set_xlabel('x')
