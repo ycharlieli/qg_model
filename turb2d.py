@@ -17,7 +17,7 @@ class QGModel:
     # 2d turbulence model
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
                  beta=0, gamma=0, 
-                 friction=0,visc2 = 0,hyperorder=1,sp_filtr=False,cl=0,
+                 friction=0.01,visc2 = 0,hyperorder=1,sp_filtr=False,cl=0,
                  forcing=None,fscale=4,finput=3,famp=1.):
         self.Nx = Nx
         self.Ny = Ny
@@ -69,7 +69,7 @@ class QGModel:
         self.kk_set = self.kk_idx_set * (2*cp.pi/self.Lx)
         self.kk_range = self.kk_idx_set < int(self.Nx/2)
         self.kk_iso = self.kk_set[self.kk_range]
-    def _init_friction(self,k_friction=4):
+    def _init_friction(self,k_friction=2):
         # Only apply drag to large-scale modes (k <= 4) to stop the condensate
         self.friction_mask = cp.zeros_like(self.kk)
         self.friction_mask[self.kk <= k_friction] = 1
@@ -156,12 +156,7 @@ class QGModel:
         
     def _get_rhs(self,q_hat):
         # based on rk4
-        if self.forcing == 'wind':
-            self._set_windforce()
-        elif self.forcing =='thuburn':
-            self.force_q = fft2(0.1*cp.sin(32*np.pi*self.x2d))
-        elif self.forcing == 'markov':
-            self._update_markovforce()
+        
         p_hat = self.inversion*q_hat
         rv_hat = q_hat + self.gamma**2*p_hat
         jacobian_term = self.compute_jacobian(p_hat,q_hat)
@@ -172,7 +167,12 @@ class QGModel:
         return -jacobian_term-beta_term+damping_term+self.force_q
 
     def _step_forward(self):
-        
+        if self.forcing == 'wind':
+            self._set_windforce()
+        elif self.forcing =='thuburn':
+            self.force_q = fft2(0.1*cp.sin(32*np.pi*self.x2d))
+        elif self.forcing == 'markov':
+            self._update_markovforce()
         q = self.q_hat
 
         k1 = self._get_rhs(q)
@@ -197,9 +197,9 @@ class QGModel:
         # Fq = cp.sin(self.fscale*self.y2d )  # horizontal shear
         Fq_hat = fft2(Fq) # amplified to get large energy
         
-        inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
-        # inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2
-        norm_fac = 1.*(self.finput)/(inputF+1e-16)
+        # inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
+        inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2 # energy injection
+        norm_fac = 1.*(self.finput)/(inputF)
         Fq_hat *= norm_fac
         self.force_q = Fq_hat
         
@@ -219,7 +219,7 @@ class QGModel:
             self.fR = 0.0
         else:
             self.fR = cp.exp(-self.dt / t_r)
-        
+        self.fseed = 10
         #  Pre-calculate the amplitude coefficient: A * sqrt(1 - R^2)
         # This ensures the variance of the forcing stays constant at A^2 over time.
         self.fcoef = famp * cp.sqrt(1 - self.fR**2)
@@ -240,6 +240,12 @@ class QGModel:
 
     def _update_markovforce(self):
         #  Generate Random Noise (ei\theta)
+        # print(self.fseed)
+        cp.random.seed(self.fseed)
+        if self.fseed < 42:
+            self.fseed +=1
+        else:
+            self.fseed = 10
         noise_phys = cp.random.randn(self.Nx, self.Ny)
         noise_hat = fft2(noise_phys)
         
@@ -249,6 +255,11 @@ class QGModel:
         #  Markov Update 
         # self.force_q currently holds F_{n-1}
         self.force_q = (self.fcoef * noise_hat) + (self.fR * self.force_q)
+        inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * self.force_q)) / (self.Nx * self.Ny)**2 # energy injection
+        # print(inputF)
+        if inputF > self.finput:
+            norm_fac = 1.*(self.finput)/(inputF)
+            self.force_q *= norm_fac
 
     def _norm_energy(self):
             self.rv_hat = self.lap*self.p_hat
@@ -295,8 +306,8 @@ class QGModel:
             psi_phys = cp.random.randn(self.Nx, self.Ny)
             rand_p = fft2(psi_phys)
             
-            rand_p[self.kk <= 4] = 0.0
-            rand_p[self.kk >= 8] = 0.0
+            rand_p[self.kk <= 3] = 0.0
+            rand_p[self.kk >= 5] = 0.0
             rand_p[0,0] = 0.0
             self.p_hat = rand_p.copy()
             
@@ -630,7 +641,7 @@ class QGModel:
 
         # Panel 1: PV Field
         q_phys = ifft2(self.q_hat).real.get()
-        im = ax_pv.imshow(q_phys, cmap=self.my_div,
+        im = ax_pv.imshow(q_phys, cmap=self.my_div,vmin=-30,vmax=30,
                           extent=[0, self.Lx, 0, self.Ly])
         ax_pv.set_title(f'Potential Vorticity (t={self.t:.2f})', fontsize=30, fontweight='bold')
         ax_pv.set_xlabel('x')
