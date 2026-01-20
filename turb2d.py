@@ -195,7 +195,7 @@ class QGModel:
         phi_y = cp.pi*cp.sin(1.4*self.t)
         Fq = cp.cos(self.fscale*self.y2d + phi_y) - cp.cos(self.fscale*self.x2d + phi_x)  # original frezat& graham
         # Fq = cp.sin(self.fscale*self.y2d )  # horizontal shear
-        Fq_hat = fft2(Fq)
+        Fq_hat = fft2(Fq) # amplified to get large energy
         
         inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
         # inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2
