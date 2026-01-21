@@ -17,7 +17,7 @@ class QGModel:
     # 2d turbulence model
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
                  beta=0, gamma=0, 
-                 friction=0.01,visc2 = 0,hyperorder=1,sp_filtr=False,cl=0,
+                 friction=0.01,k_friction = 20000,visc2 = 0,hyperorder=1,sp_filtr=False,cl=0,
                  forcing=None,fscale=4,finput=3,famp=1.):
         self.Nx = Nx
         self.Ny = Ny
@@ -30,7 +30,8 @@ class QGModel:
         # parameter of qg
         self.beta = beta
         self.gamma = gamma
-        self.friction = friction # large scale friction 
+        self.friction = friction # large scale friction
+        self.k_friction = k_friction 
         self.visc2 = visc2  #eddy viscosity
         self.hyvisc = 10*1/(self.Nx*(2*cp.pi/self.Lx))**(hyperorder*2) # viscosity
         self.hyperorder = hyperorder # order of hyper viscosity, 1-> Newnation 2-> biharmonic ...
@@ -69,10 +70,10 @@ class QGModel:
         self.kk_set = self.kk_idx_set * (2*cp.pi/self.Lx)
         self.kk_range = self.kk_idx_set < int(self.Nx/2)
         self.kk_iso = self.kk_set[self.kk_range]
-    def _init_friction(self,k_friction=2):
+    def _init_friction(self):
         # Only apply drag to large-scale modes (k <= 4) to stop the condensate
         self.friction_mask = cp.zeros_like(self.kk)
-        self.friction_mask[self.kk <= k_friction] = 1
+        self.friction_mask[self.kk <= self.k_friction] = 1
         self.friction_mask[0,0] = 1 # Handle mean flow
 
     def _init_filter(self):
@@ -212,17 +213,6 @@ class QGModel:
         # from Maltrud and Vallis 1991
         k_min = self.fscale-2
         k_max = self.fscale+2
-        # arkov Coefficient R 
-        # R depends on the timestep dt and correlation time t_r
-        # If t_r = 0, R = 0 (White Noise). 
-        if t_r == 0:
-            self.fR = 0.0
-        else:
-            self.fR = cp.exp(-self.dt / t_r)
-        self.fseed = 10
-        #  Pre-calculate the amplitude coefficient: A * sqrt(1 - R^2)
-        # This ensures the variance of the forcing stays constant at A^2 over time.
-        self.fcoef = famp * cp.sqrt(1 - self.fR**2)
         
         #  Create the Spectral Mask
         #  forcing only to a specific wavenumber shell.
@@ -234,6 +224,23 @@ class QGModel:
         
         # Ensure the mean (k=0) is never forced
         self.fmask[0, 0] = 0.0
+
+        # fix norm
+        n_modes = cp.sum(self.fmask)
+
+        norm_fac = 1/ cp.sqrt(n_modes)
+
+        # Markov Coefficient R 
+        # R depends on the timestep dt and correlation time t_r
+        # If t_r = 0, R = 0 (White Noise). 
+        if t_r == 0:
+            self.fR = 0.0
+        else:
+            self.fR = cp.exp(-self.dt / t_r)
+        self.fseed = 10
+        #  Pre-calculate the amplitude coefficient: A * sqrt(1 - R^2)
+        # This ensures the variance of the forcing stays constant at A^2 over time.
+        self.fcoef = norm_fac*famp * cp.sqrt(1 - self.fR**2)
         
         # Initialize the forcing field F_{n-1} to zero
         self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
@@ -255,11 +262,14 @@ class QGModel:
         #  Markov Update 
         # self.force_q currently holds F_{n-1}
         self.force_q = (self.fcoef * noise_hat) + (self.fR * self.force_q)
-        inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * self.force_q)) / (self.Nx * self.Ny)**2 # energy injection
-        # print(inputF)
-        if inputF > self.finput:
-            norm_fac = 1.*(self.finput)/(inputF)
-            self.force_q *= norm_fac
+        # energt fixer
+        # inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * self.force_q)) / (self.Nx * self.Ny)**2 # energy injection
+        # # print(inputF)
+        # if inputF > self.finput:
+        #     norm_fac = 1.*(self.finput)/(inputF)
+        #     self.force_q *= norm_fac
+        
+
 
     def _norm_energy(self):
             self.rv_hat = self.lap*self.p_hat
@@ -305,11 +315,20 @@ class QGModel:
         elif scheme == 'gauss':
             psi_phys = cp.random.randn(self.Nx, self.Ny)
             rand_p = fft2(psi_phys)
+            fmask = cp.zeros_like(self.kk)
+        
+            # Select wavenumbers inside the shell
+            idx = (self.kk >= 3) & (self.kk <= 5)
+            fmask[idx] = 1.0
             
-            rand_p[self.kk <= 3] = 0.0
-            rand_p[self.kk >= 5] = 0.0
-            rand_p[0,0] = 0.0
-            self.p_hat = rand_p.copy()
+            # Ensure the mean (k=0) is never forced
+            fmask[0, 0] = 0.0
+
+            # fix norm
+            n_modes = cp.sum(fmask)
+
+            norm_fac = 1/ cp.sqrt(n_modes)
+            self.p_hat = rand_p.copy()*fmask
             
             if eini:
                 self._norm_energy()
@@ -641,7 +660,7 @@ class QGModel:
 
         # Panel 1: PV Field
         q_phys = ifft2(self.q_hat).real.get()
-        im = ax_pv.imshow(q_phys, cmap=self.my_div,vmin=-30,vmax=30,
+        im = ax_pv.imshow(q_phys, cmap=self.my_div,vmin=-10,vmax=10,
                           extent=[0, self.Lx, 0, self.Ly])
         ax_pv.set_title(f'Potential Vorticity (t={self.t:.2f})', fontsize=30, fontweight='bold')
         ax_pv.set_xlabel('x')
