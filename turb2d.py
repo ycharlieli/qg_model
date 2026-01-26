@@ -804,8 +804,7 @@ class QGModel:
     def run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0',saveplot=False):
         self.tmax = tmax
         self.tsave = tsave
-        self.t = 0   
-        self.n_steps = 0  
+        self.t = 0    
         self.savedir = savedir
         os.makedirs(self.savedir, exist_ok=True)
         insave=nsave
@@ -813,6 +812,7 @@ class QGModel:
         nf=0
 
         for n in range(int(tmax/self.dt)+1):
+            self.n_steps = n
             if insave == nsave:
                 itsave =0 #time index
                 if nf > 0 : self.ds.close()
@@ -833,7 +833,6 @@ class QGModel:
             
             self._step_forward(scheme=scheme)
             self.t += self.dt
-            self.n_steps += 1
         self.ds.close()
         print('Done.')
     
