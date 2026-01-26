@@ -156,7 +156,6 @@ class QGModel:
 
         
     def _get_rhs(self,q_hat):
-        # based on rk4
         
         p_hat = self.inversion*q_hat
         rv_hat = q_hat + self.gamma**2*p_hat
@@ -167,7 +166,15 @@ class QGModel:
         
         return -jacobian_term-beta_term+damping_term+self.force_q
 
-    def _step_forward(self):
+    def _rk4(self, q_hat):
+        k1 = self._get_rhs(q_hat)
+        k2 = self._get_rhs(q_hat + 0.5 * self.dt * k1)
+        k3 = self._get_rhs(q_hat + 0.5 * self.dt * k2)
+        k4 = self._get_rhs(q_hat + self.dt * k3)
+
+        return k1,k2,k3,k4
+
+    def _step_forward(self,scheme='ab3'):
         if self.forcing == 'wind':
             self._set_windforce()
         elif self.forcing =='thuburn':
@@ -176,12 +183,27 @@ class QGModel:
             self._update_markovforce()
         q = self.q_hat
 
-        k1 = self._get_rhs(q)
-        k2 = self._get_rhs(q + 0.5 * self.dt * k1)
-        k3 = self._get_rhs(q + 0.5 * self.dt * k2)
-        k4 = self._get_rhs(q + self.dt * k3)
-        
-        self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        if scheme=='rk4':
+        # 4th order Runge-Kunta 
+            k1,k2,k3,k4 = self._rk4(q)
+            self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        elif scheme == 'ab3':
+        # 3rd order adambash forth
+            if self.t == self.dt*0:
+                k1,k2,k3,k4 = self._rk4(q)
+                self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+                self.k1_pp = k1.copy()
+            elif self.t == self.dt*1:
+                k1,k2,k3,k4 = self._rk4(q)
+                self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+                self.k1_p = k1.copy()
+            else:
+                k1 = self._get_rhs(q)
+                self.q_hat = q + self.dt/12*(23*k1-16*self.k1_p+5*self.k1_pp)
+                self.k1_pp = self.k1_p
+                self.k1_p = k1.copy()
+                
+
         self.q_hat *=self.filtr
         self.p_hat = self.inversion*self.q_hat
         self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
@@ -779,7 +801,7 @@ class QGModel:
 
         return flux_x_hat+flux_y_hat
         
-    def run(self,tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0',saveplot=False):
+    def run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0',saveplot=False):
         self.tmax = tmax
         self.tsave = tsave
         self.t = 0     
@@ -808,7 +830,7 @@ class QGModel:
                 self.save_snapshot(inplot) 
                 inplot+=1
             
-            self._step_forward()
+            self._step_forward(scheme=scheme)
             self.t += self.dt
         self.ds.close()
         print('Done.')
