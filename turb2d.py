@@ -189,11 +189,11 @@ class QGModel:
             self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
         elif scheme == 'ab3':
         # 3rd order adambash forth
-            if self.t == self.dt*0:
+            if self.n_steps == 0:
                 k1,k2,k3,k4 = self._rk4(q)
                 self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
                 self.k1_pp = k1.copy()
-            elif self.t == self.dt*1:
+            elif self.n_steps == 1:
                 k1,k2,k3,k4 = self._rk4(q)
                 self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
                 self.k1_p = k1.copy()
@@ -804,7 +804,8 @@ class QGModel:
     def run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0',saveplot=False):
         self.tmax = tmax
         self.tsave = tsave
-        self.t = 0     
+        self.t = 0   
+        self.n_steps = 0  
         self.savedir = savedir
         os.makedirs(self.savedir, exist_ok=True)
         insave=nsave
@@ -832,6 +833,7 @@ class QGModel:
             
             self._step_forward(scheme=scheme)
             self.t += self.dt
+            self.n_steps += 1
         self.ds.close()
         print('Done.')
     
