@@ -24,8 +24,6 @@ class QGModel:
         self.Lx = Lx
         self.Ly = Ly
         self.dt = dt
-        self.x = cp.linspace(0,self.Lx,self.Nx)
-        self.y = cp.linspace(0,self.Ly,self.Ny)
         self._init_grid()
         # parameter of qg
         self.beta = beta
@@ -42,10 +40,11 @@ class QGModel:
         self.finput = finput # enstrophy injection rate of wind
         self.famp = famp
         self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
+        self.cda_term = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
         self._prebuild_operator()
         self._my_div()
         # gpu or cpu?  backend
-###
+### private term
     def _init_grid(self):
         self.x = cp.linspace(0,self.Lx,self.Nx)
         self.y = cp.linspace(0,self.Ly,self.Ny)
@@ -159,12 +158,12 @@ class QGModel:
         
         p_hat = self.inversion*q_hat
         rv_hat = q_hat + self.gamma**2*p_hat
-        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        jacobian_term = self._compute_jacobian(p_hat,q_hat)
         beta_term = self.beta*self.kx2d*1j*p_hat
         damping_term = (-self.friction_mask*self.friction + self.visc2*self.lap+ self.hylap)*rv_hat
-        damping_term+=self.compute_leith_term()
+        damping_term+=self._compute_leith_term()
         
-        return -jacobian_term-beta_term+damping_term+self.force_q
+        return -jacobian_term-beta_term+damping_term+self.force_q+self.cda_term
 
     def _rk4(self, q_hat):
         k1 = self._get_rhs(q_hat)
@@ -209,90 +208,47 @@ class QGModel:
         self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
         
     
+    def _compute_jacobian(self,p_hat,q_hat):
+        dxp_hat = self.kx2d*1j*p_hat
+        dyp_hat = self.ky2d*1j*p_hat
+        dxq_hat = self.kx2d*1j*q_hat
+        dyq_hat = self.ky2d*1j*q_hat
+        # zeropadding to subsample with the high frequency to avoid aliasing 
+        dxq_r = ifft2(self._padding(dxq_hat)).real
+        dyq_r = ifft2(self._padding(dyq_hat)).real
+        dxp_r = ifft2(self._padding(dxp_hat)).real
+        dyp_r = ifft2(self._padding(dyp_hat)).real
+    
+        jacob_r = dyq_r*dxp_r-dyp_r*dxq_r
+    
+        jacob_hat = self._unpadding(fft2(jacob_r))
+    
+        return jacob_hat
+
+    def _compute_leith_term(self):
+        dxrv_hat = self.kx2d*1j*self.rv_hat
+        dyrv_hat = self.ky2d*1j*self.rv_hat
+        
+        dxrv_r = ifft2(self._padding(dxrv_hat)).real
+        dyrv_r = ifft2(self._padding(dyrv_hat)).real
+        
+        grad_rv_r = cp.sqrt(dxrv_r**2+dyrv_r**2)
+        
+        nabla = self.Lx/self.Nx
+        nu_e = (self.cl*nabla)**3*grad_rv_r
+        
+        flux_x_r = nu_e*dxrv_r
+        flux_y_r = nu_e*dyrv_r
+
+        flux_x_hat = self.kx2d*1j*self._unpadding(fft2(flux_x_r))
+        flux_y_hat = self.ky2d*1j*self._unpadding(fft2(flux_y_r))
+
+        
+
+        return flux_x_hat+flux_y_hat
     # def upscale(self,Nxup,Nyup):
 
-    def _set_windforce(self):
-        # graham 2013 and Frezat 2022
-        # only valid for 2pi domain
-        phi_x = cp.pi*cp.sin(1.5*self.t)
-        phi_y = cp.pi*cp.sin(1.4*self.t)
-        Fq = cp.cos(self.fscale*self.y2d + phi_y) - cp.cos(self.fscale*self.x2d + phi_x)  # original frezat& graham
-        # Fq = cp.sin(self.fscale*self.y2d )  # horizontal shear
-        Fq_hat = fft2(Fq) # amplified to get large energy
-        
-        # inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
-        inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2 # energy injection
-        norm_fac = 1.*(self.finput)/(inputF)
-        Fq_hat *= norm_fac
-        self.force_q = Fq_hat
-        
-        # plt.imshow(ifft2(Fq_hat).real.get())
-        # plt.colorbar()
-        # plt.show()
-    
-    def _init_markovforce(self, famp=1.0, t_r=0.5):
-        # markovian forcing 
-        # from Maltrud and Vallis 1991
-        k_min = self.fscale-2
-        k_max = self.fscale+2
-        
-        #  Create the Spectral Mask
-        #  forcing only to a specific wavenumber shell.
-        self.fmask = cp.zeros_like(self.kk)
-        
-        # Select wavenumbers inside the shell
-        idx = (self.kk >= k_min) & (self.kk <= k_max)
-        self.fmask[idx] = 1.0
-        
-        # Ensure the mean (k=0) is never forced
-        self.fmask[0, 0] = 0.0
-
-        # fix norm
-        n_modes = cp.sum(self.fmask)
-
-        norm_fac = 1/ cp.sqrt(n_modes)
-
-        # Markov Coefficient R 
-        # R depends on the timestep dt and correlation time t_r
-        # If t_r = 0, R = 0 (White Noise). 
-        if t_r == 0:
-            self.fR = 0.0
-        else:
-            self.fR = cp.exp(-self.dt / t_r)
-        self.fseed = 10
-        #  Pre-calculate the amplitude coefficient: A * sqrt(1 - R^2)
-        # This ensures the variance of the forcing stays constant at A^2 over time.
-        self.fcoef = norm_fac*famp * cp.sqrt(1 - self.fR**2)
-        
-        # Initialize the forcing field F_{n-1} to zero
-        self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
-
-    def _update_markovforce(self):
-        #  Generate Random Noise (ei\theta)
-        # print(self.fseed)
-        cp.random.seed(self.fseed)
-        if self.fseed < 42:
-            self.fseed +=1
-        else:
-            self.fseed = 10
-        noise_phys = cp.random.randn(self.Nx, self.Ny)
-        noise_hat = fft2(noise_phys)
-        
-        #  Apply Spectral Mask
-        noise_hat *= self.fmask
-        
-        #  Markov Update 
-        # self.force_q currently holds F_{n-1}
-        self.force_q = (self.fcoef * noise_hat) + (self.fR * self.force_q)
-        # energt fixer
-        # inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * self.force_q)) / (self.Nx * self.Ny)**2 # energy injection
-        # # print(inputF)
-        # if inputF > self.finput:
-        #     norm_fac = 1.*(self.finput)/(inputF)
-        #     self.force_q *= norm_fac
-        
-
-
+### initial term
     def _norm_energy(self):
             self.rv_hat = self.lap*self.p_hat
             # initial potential vorticity (q)
@@ -379,7 +335,89 @@ class QGModel:
             self.rv_hat = self.lap*self.p_hat
         self.Etot = self.get_Etot(self.p_hat)
         self.Ek = self.get_Ek(self.p_hat)
-        self.tenlk, self.tznlk, self.fenlk, self.fznlk = self.get_diagNL(self.p_hat,self.q_hat)    
+        self.tenlk, self.tznlk, self.fenlk, self.fznlk = self.get_diagNL(self.p_hat,self.q_hat)   
+     
+### forcing term 
+    def _set_windforce(self):
+        # graham 2013 and Frezat 2022
+        # only valid for 2pi domain
+        phi_x = cp.pi*cp.sin(1.5*self.t)
+        phi_y = cp.pi*cp.sin(1.4*self.t)
+        Fq = cp.cos(self.fscale*self.y2d + phi_y) - cp.cos(self.fscale*self.x2d + phi_x)  # original frezat& graham
+        # Fq = cp.sin(self.fscale*self.y2d )  # horizontal shear
+        Fq_hat = fft2(Fq) # amplified to get large energy
+        
+        # inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
+        inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2 # energy injection
+        norm_fac = 1.*(self.finput)/(inputF)
+        Fq_hat *= norm_fac
+        self.force_q = Fq_hat
+        
+        # plt.imshow(ifft2(Fq_hat).real.get())
+        # plt.colorbar()
+        # plt.show()
+    
+    def _init_markovforce(self, famp=1.0, t_r=0.5):
+        # markovian forcing 
+        # from Maltrud and Vallis 1991
+        k_min = self.fscale-2
+        k_max = self.fscale+2
+        
+        #  Create the Spectral Mask
+        #  forcing only to a specific wavenumber shell.
+        self.fmask = cp.zeros_like(self.kk)
+        
+        # Select wavenumbers inside the shell
+        idx = (self.kk >= k_min) & (self.kk <= k_max)
+        self.fmask[idx] = 1.0
+        
+        # Ensure the mean (k=0) is never forced
+        self.fmask[0, 0] = 0.0
+
+        # fix norm
+        n_modes = cp.sum(self.fmask)
+
+        norm_fac = 1/ cp.sqrt(n_modes)
+
+        # Markov Coefficient R 
+        # R depends on the timestep dt and correlation time t_r
+        # If t_r = 0, R = 0 (White Noise). 
+        if t_r == 0:
+            self.fR = 0.0
+        else:
+            self.fR = cp.exp(-self.dt / t_r)
+        self.fseed = 10
+        #  Pre-calculate the amplitude coefficient: A * sqrt(1 - R^2)
+        # This ensures the variance of the forcing stays constant at A^2 over time.
+        self.fcoef = norm_fac*famp * cp.sqrt(1 - self.fR**2)
+        
+        # Initialize the forcing field F_{n-1} to zero
+        self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
+
+    def _update_markovforce(self):
+        #  Generate Random Noise (ei\theta)
+        # print(self.fseed)
+        cp.random.seed(self.fseed)
+        if self.fseed < 42:
+            self.fseed +=1
+        else:
+            self.fseed = 10
+        noise_phys = cp.random.randn(self.Nx, self.Ny)
+        noise_hat = fft2(noise_phys)
+        
+        #  Apply Spectral Mask
+        noise_hat *= self.fmask
+        
+        #  Markov Update 
+        # self.force_q currently holds F_{n-1}
+        self.force_q = (self.fcoef * noise_hat) + (self.fR * self.force_q)
+        # energt fixer
+        # inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * self.force_q)) / (self.Nx * self.Ny)**2 # energy injection
+        # # print(inputF)
+        # if inputF > self.finput:
+        #     norm_fac = 1.*(self.finput)/(inputF)
+        #     self.force_q *= norm_fac
+
 ## diagnostic term
     def get_Ek(self,p_hat):
         # Isotropic Energy spectrum
@@ -407,19 +445,19 @@ class QGModel:
         ens_tot = np.sum(ens_kk)
         return ens_tot
     def get_TENL(self,p_hat,q_hat):
-        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        jacobian_term = self._compute_jacobian(p_hat,q_hat)
         # spectral energy transfer of non-linear advection
         tenl = cp.real(cp.conj(p_hat)*jacobian_term)
         return tenl
     
     def get_TZNL(self,p_hat,q_hat):
-        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        jacobian_term = self._compute_jacobian(p_hat,q_hat)
         # spectral enstrophy transfer of non-linear advection
         tznl = -cp.real(cp.conj(q_hat)*jacobian_term)
         return tznl
 
     def get_diagNL(self,p_hat,q_hat):
-        jacobian_term = self.compute_jacobian(p_hat,q_hat)
+        jacobian_term = self._compute_jacobian(p_hat,q_hat)
         # spectral energy transfer of non-linear advection
         tenl = cp.real(cp.conj(p_hat)*jacobian_term)
         # spectral enstrophy transfer of non-linear advection
@@ -509,11 +547,9 @@ class QGModel:
         fefilt_kk = np.cumsum(tefilt_kk[::-1])[::-1]
         # Isotropic spectrum of enstrophy flux of friction
         fzfilt_kk = np.cumsum(tzfilt_kk[::-1])[::-1]
-        return tefilt_kk, tzfilt_kk, fefilt_kk, fzfilt_kk
+        return tefilt_kk, tzfilt_kk, fefilt_kk, fzfilt_kk 
     
-    
-    
-###   
+### save term   
     def create_nc(self,nf):
         outdir = self.savedir
         nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
@@ -762,45 +798,7 @@ class QGModel:
         filename = os.path.join(outdir, f"snap_{nstep:04d}.png")
         self.plot_diag(save_path=filename)
 
-    def compute_jacobian(self,p_hat,q_hat):
-        dxp_hat = self.kx2d*1j*p_hat
-        dyp_hat = self.ky2d*1j*p_hat
-        dxq_hat = self.kx2d*1j*q_hat
-        dyq_hat = self.ky2d*1j*q_hat
-        # zeropadding to subsample with the high frequency to avoid aliasing 
-        dxq_r = ifft2(self._padding(dxq_hat)).real
-        dyq_r = ifft2(self._padding(dyq_hat)).real
-        dxp_r = ifft2(self._padding(dxp_hat)).real
-        dyp_r = ifft2(self._padding(dyp_hat)).real
-    
-        jacob_r = dyq_r*dxp_r-dyp_r*dxq_r
-    
-        jacob_hat = self._unpadding(fft2(jacob_r))
-    
-        return jacob_hat
-
-    def compute_leith_term(self):
-        dxrv_hat = self.kx2d*1j*self.rv_hat
-        dyrv_hat = self.ky2d*1j*self.rv_hat
-        
-        dxrv_r = ifft2(self._padding(dxrv_hat)).real
-        dyrv_r = ifft2(self._padding(dyrv_hat)).real
-        
-        grad_rv_r = cp.sqrt(dxrv_r**2+dyrv_r**2)
-        
-        nabla = self.Lx/self.Nx
-        nu_e = (self.cl*nabla)**3*grad_rv_r
-        
-        flux_x_r = nu_e*dxrv_r
-        flux_y_r = nu_e*dyrv_r
-
-        flux_x_hat = self.kx2d*1j*self._unpadding(fft2(flux_x_r))
-        flux_y_hat = self.ky2d*1j*self._unpadding(fft2(flux_y_r))
-
-        
-
-        return flux_x_hat+flux_y_hat
-        
+### run 
     def run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0',saveplot=False):
         self.tmax = tmax
         self.tsave = tsave
