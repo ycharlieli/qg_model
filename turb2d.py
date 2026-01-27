@@ -345,12 +345,16 @@ class QGModel:
         phi_y = cp.pi*cp.sin(1.4*self.t)
         Fq = cp.cos(self.fscale*self.y2d + phi_y) - cp.cos(self.fscale*self.x2d + phi_x)  # original frezat& graham
         # Fq = cp.sin(self.fscale*self.y2d )  # horizontal shear
-        Fq_hat = fft2(Fq) # amplified to get large energy
+        normF = cp.linalg.norm(Fq) /self.Nx # fix  L2 norm
+
+        norm_fac = self.famp/normF
+
+        Fq_hat = fft2(norm_fac*Fq) # amplified to get large energy
         
         # inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
-        inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2 # energy injection
-        norm_fac = 1.*(self.finput)/(inputF)
-        Fq_hat *= norm_fac
+        # inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2 # energy injection
+        # norm_fac = 1.*(self.finput)/(inputF)
+        # Fq_hat *= norm_fac
         self.force_q = Fq_hat
         
         # plt.imshow(ifft2(Fq_hat).real.get())
@@ -432,6 +436,12 @@ class QGModel:
         ene_kk = self.get_Ek(p_hat)
         ene_tot = np.sum(ene_kk) 
         return ene_tot
+
+    def get_Vrms(self,p_hat):
+        ene_tot = self.get_Etot(p_hat)
+        vrms = np.sqrt(2*ene_tot/(self.Nx*self.Ny))
+        return vrms
+
     def get_Zk(self,q_hat):
         # Enstrophy density in spectral space
         ens_dens = 0.5*np.abs(q_hat)**2
@@ -495,7 +505,26 @@ class QGModel:
         fzF_kk = np.cumsum(tzF_kk[::-1])[::-1]
 
         return teF_kk, tzF_kk, feF_kk, fzF_kk
-    
+
+    def get_diagCda(self,p_hat,q_hat,cda_term):
+        # spectral energy transfer of forcing
+        tecda = -cp.real(cp.conj(p_hat)*cda_term)
+        # spectral enstrophy transfoer of forcing
+        tzcda = cp.real(cp.conj(q_hat)*cda_term)
+        norm_fac = 1/(self.Nx*self.Ny)
+        # Isotropic spectrum of energy transfer of non-linear advection
+        # In physical space 
+        tecda_kk = npg.aggregate(self.kk_idx.ravel().get(),tecda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of enstrophy transfer of non-linear advection
+        # In physical space 
+        tzcda_kk =npg.aggregate(self.kk_idx.ravel().get(),tzcda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        # Isotropic spectrum of energy flux of forcing
+        fecda_kk = np.cumsum(tecda_kk[::-1])[::-1]
+        # Isotropic spectrum of enstrophy flux of forcing
+        fzcda_kk = np.cumsum(tzcda_kk[::-1])[::-1]
+
+        return tecda_kk, tzcda_kk, fecda_kk, fzcda_kk
+
     def get_diagFric(self,p_hat,q_hat):
         # spectral energy transfer of friction
         tefric = -2*self.friction_mask*self.friction* 0.5*self.kk**2*cp.abs(p_hat)**2
@@ -572,6 +601,7 @@ class QGModel:
         ## diagonistic variable
         ## invariant quantities
         self.Etot_var = self.ds.createVariable('Etot', 'f8', ('time',))
+        self.Vrms_var = self.ds.createVariable('Vrms', 'f8', ('time',))
         self.Ztot_var = self.ds.createVariable('Ztot', 'f8', ('time',))
         self.Ek_var = self.ds.createVariable('Ek', 'f8', ('time', 'k'), zlib=False)
         self.Zk_var = self.ds.createVariable('Zk', 'f8', ('time', 'k'), zlib=False)
@@ -635,6 +665,7 @@ class QGModel:
         # diagnostic variable
         # invariant quantities
         self.Etot_var[it] = self.get_Etot(self.p_hat)
+        self.Vrms_var[it] = self.get_Vrms(self.p_hat)
         self.Ztot_var[it] = self.get_Ztot(self.q_hat)
         self.Ek_var[it,:] = self.get_Ek(self.p_hat) 
         self.Zk_var[it,:] = self.get_Zk(self.q_hat) 
@@ -652,7 +683,7 @@ class QGModel:
         self.ds.sync()
         del q_r, p_r, rv_r
         gc.collect()
-        
+### plot term     
     def plot_diag(self, save_path=None):
         """
         Plots the current state and Energy budgets (Tendency and Flux).
@@ -675,6 +706,7 @@ class QGModel:
         tevisc, _, fevisc, _ = self.get_diagVisc(self.p_hat, self.q_hat)
         tefric, _, fefric, _ = self.get_diagFric(self.p_hat, self.q_hat)
         tefilt, _, fefilt, _ = self.get_diagFilt(self.p_hat, self.q_hat)
+        tecda,_,fecda,_ = self.get_diagCda(self.p_hat,self.q_hat,self.cda_term)
         # --- 2. Normalize to Mean (Density) ---
         # Current variables are "Total Sums". Divide by grid size to get "Mean per point".
         norm_fac = 1.0 / (self.Nx * self.Ny)
@@ -685,6 +717,7 @@ class QGModel:
         tevisc *= norm_fac
         tefric *= norm_fac
         tefilt *= norm_fac
+        tecda *= norm_fac
         
         # Scale Fluxes
         fenl *= norm_fac
@@ -692,16 +725,17 @@ class QGModel:
         fevisc *= norm_fac
         fefric *= norm_fac
         fefilt *= norm_fac
+        fecda *= norm_fac
         
         # Scale Energy Spectrum
         Ek = Ek * norm_fac
 
         # D. Residuals (Should be ~0 in steady state)
         # Tendency Residual: dE/dt = NL + Forcing + Viscosity + Friction
-        te_sum = tenl + teF + tevisc + tefric + tefilt
+        te_sum = tenl + teF + tevisc + tefric + tefilt + tecda
         
         # Flux Residual: Sum of cumulative fluxes
-        fe_sum = fenl + feF + fevisc + fefric + fefilt
+        fe_sum = fenl + feF + fevisc + fefric + fefilt + fecda
 
         # --- 3. Setup Figure ---
         plt.rcParams.update({'font.size': 20})
@@ -752,8 +786,9 @@ class QGModel:
         ax_tendency.semilogx(ks, tenl, label='NL Transfer', color='tab:blue', linewidth=2.5)
         ax_tendency.semilogx(ks, teF, label='Forcing', color='tab:green', linewidth=2.5)
         ax_tendency.semilogx(ks, tevisc, label='Viscosity', color='tab:orange', linewidth=2.5)
-        ax_tendency.semilogx(ks, tefric, label='Friction', color='tab:red', linewidth=2.5)
+        ax_tendency.semilogx(ks, tefric, label='Friction', color='tab:brown', linewidth=2.5)
         ax_tendency.semilogx(ks, tefilt, label='Filter', color='tab:purple', linewidth=2.5)
+        ax_tendency.semilogx(ks, tecda, label='CDA', color='tab:red', linewidth=2.5)
         ax_tendency.semilogx(ks, te_sum, 'k--', label='Sum (Residual)', linewidth=1.5)
         
         ax_tendency.axhline(0, color='k', linestyle='-', linewidth=1.5)
@@ -769,8 +804,9 @@ class QGModel:
         ax_flux.semilogx(ks, fenl, label='NL Flux $\Pi_{NL}$', color='tab:blue', linewidth=2.5)
         ax_flux.semilogx(ks, feF, label='Forcing Flux', color='tab:green', linewidth=2.5)
         ax_flux.semilogx(ks, fevisc, label='Visc. Flux', color='tab:orange', linewidth=2.5)
-        ax_flux.semilogx(ks, fefric, label='Fric. Flux', color='tab:red', linewidth=2.5)
+        ax_flux.semilogx(ks, fefric, label='Fric. Flux', color='tab:brown', linewidth=2.5)
         ax_flux.semilogx(ks, fefilt, label='Filt. Flux', color='tab:purple', linewidth=2.5)
+        ax_flux.semilogx(ks, fecda, label='Cda. Flux', color='tab:red', linewidth=2.5)
         ax_flux.semilogx(ks, fe_sum, 'k--', label='Sum (Residual)', linewidth=1.5)
 
         ax_flux.axhline(0, color='k', linestyle='-', linewidth=1.5)
@@ -799,14 +835,13 @@ class QGModel:
         self.plot_diag(save_path=filename)
 
 ### run 
-    def run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,tplot=1000,savedir='run_0',saveplot=False):
+    def run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,savedir='run_0',saveplot=False):
         self.tmax = tmax
         self.tsave = tsave
         self.t = 0    
         self.savedir = savedir
         os.makedirs(self.savedir, exist_ok=True)
         insave=nsave
-        inplot = 0
         nf=0
 
         for n in range(int(tmax/self.dt)+1):
@@ -824,10 +859,7 @@ class QGModel:
                     self.plot_diag()
                 itsave +=1
                 insave +=1
-            if n%tplot ==0:
-                print(f"\t saving figure", end="\n")
-                self.save_snapshot(inplot) 
-                inplot+=1
+
             
             self._step_forward(scheme=scheme)
             self.t += self.dt
