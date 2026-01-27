@@ -36,7 +36,7 @@ class QGCDA:
         ratio = self.Nobs/self.m.Nx
         rcoord_x =  x_model.ravel() * ratio# relative coordinate of model to observation
         rcoord_y =  y_model.ravel() * ratio
-        self.rcoord_model = cp.array([rcoord_x,rcoord_y])
+        self.rcoord_model = cp.array([rcoord_y,rcoord_x])
         
 
     def _step_cda(self):
@@ -86,10 +86,10 @@ class QGCDA:
 
 
 
-    def cda_run(self,scheme='ab3',trst=0,tmax=40,tsave=200,nsave=100,savedir='run_cda0',saveplot=False):
+    def cda_run(self,scheme='ab3',trst=0,trst_ref= 0,tmax=40,tsave=200,nsave=100,savedir='run_cda0',saveplot=False):
         
         self.m.t = trst
-        self.m_ref.t = trst    
+        self.m_ref.t = trst_ref    
         self.m.n_steps = 0
         self.m_ref.n_steps = 0
 
@@ -99,7 +99,7 @@ class QGCDA:
         total_steps = int(round(tmax/self.dt))
 
         print(f"Starting CDA. dTobs={self.dTobs}, tmax={tmax}")
-        print(f"Ratios -> Model: {self.intvl_model}, Ref: {self.intvl_ref}, Obs: {self.intvl_cda}")
+        print(f"Step interval -> Model: {self.intvl_model}, Ref: {self.intvl_ref}, Obs: {self.intvl_cda}")
         insave=nsave
         nf=0
 
