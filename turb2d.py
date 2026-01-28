@@ -189,7 +189,7 @@ class QGModel:
             self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
         elif self.ts_scheme == 'ab3':
         # 3rd order adambash forth
-            if is_not_rst:
+            if self.is_not_rst:
                 if self.n_steps == 0:
                     k1,k2,k3,k4 = self._rk4(q)
                     self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
@@ -603,7 +603,7 @@ class QGModel:
         time_dim = self.rstds.createDimension('time', None) 
         if self.ts_scheme  == 'rk4':
             ind_dim = self.rstds.createDimension('ind', 1) 
-        elif self.ts_scheme =  'ab3':
+        elif self.ts_scheme ==  'ab3':
             ind_dim = self.rstds.createDimension('ind', 3) 
         x_dim = self.rstds.createDimension('x', self.Nx)
         y_dim = self.rstds.createDimension('y', self.Ny)
@@ -613,7 +613,7 @@ class QGModel:
         ys = self.rstds.createVariable('y', 'f8', ('y',))
         if self.ts_scheme  == 'rk4':
             inds[:] = cp.array([0,])
-        elif self.ts_scheme =  'ab3':
+        elif self.ts_scheme ==  'ab3':
             inds[:] = cp.array([0,1,2])
         xs[:] = self.x.get()
         ys[:] = self.y.get()
@@ -911,8 +911,12 @@ class QGModel:
         self.t = 0    
         self.savedir = savedir
         os.makedirs(self.savedir, exist_ok=True)
+        tsrst = int(1/self.dt) # save rst every 1  time unit timestep
+        nrst = nsave
         insave=nsave
+        inrst = nrst
         nf=0
+        nfrst=0
 
         for n in range(int(tmax/self.dt)+1):
             self.n_steps = n
@@ -930,7 +934,17 @@ class QGModel:
                 itsave +=1
                 insave +=1
 
-            
+            if self.n_steps % tsrst==0:
+                    if inrst == nrst:
+                        itrst =0 #time index -it
+                        if nfrst > 0 : self.rstds.close()
+                        self.create_rst(nfrst)
+                        insave=0 #save number index-in
+                        nfrst+=1
+
+                    self.save_rst(itrst)
+                    itrst +=1
+                    inrst +=1
             self._step_forward()
             self.t += self.dt
         self.ds.close()

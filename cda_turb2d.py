@@ -168,11 +168,11 @@ class QGCDA:
                     if inrst == nrst:
                         itrst =0 #time index -it
                         if nfrst > 0 : self.m.rstds.close()
-                        self.create_rst(nfrst)
+                        self.m.create_rst(nfrst)
                         insave=0 #save number index-in
                         nfrst+=1
 
-                    self.save_rst(itrst)
+                    self.m.save_rst(itrst)
                     itrst +=1
                     inrst +=1
 
