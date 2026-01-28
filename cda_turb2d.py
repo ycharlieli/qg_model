@@ -40,6 +40,7 @@ class QGCDA:
         
 
     def _step_cda(self):
+        #TODO currently only nudging vorticity
         q_m_r = ifft2(self.m.q_hat).real # back to physical space (real space)
         q_ref_r = ifft2(self.m_ref.q_hat).real
 
@@ -48,11 +49,16 @@ class QGCDA:
 
         q_m_sub = q_m_sub - cp.mean(q_m_sub) #zero correction for periodic domain
         q_ref_sub = q_ref_sub - cp.mean(q_ref_sub)
+         
         if self.interpolant == 'linear':
-            self.cda_forcing = self.mu*(self._linear_intp(q_ref_sub)-self._linear_intp(q_m_sub))
+            self.Ih_m = self._linear_intp(q_m_sub)
+            self.Ih_ref = self._linear_intp(q_ref_sub)
+            
         elif self.interpolant == 'block':
-            self.cda_forcing = self.mu*(self._block_intp(q_ref_sub)-self._block_intp(q_m_sub))
-
+            self.Ih_m = self._block_intp(q_m_sub)
+            self.Ih_ref = self._block_intp(q_ref_sub)
+            
+        self.cda_forcing = self.mu*(self.Ih_ref-self.Ih_m)
         self.m.cda_term = fft2(self.cda_forcing)# back to fourier space
 
 
@@ -66,11 +72,28 @@ class QGCDA:
         phi_intp = map_coordinates(phi,self.rcoord_model,order=0,mode='wrap',prefilter=False)
         return phi_intp.reshape(self.m.Nx,self.m.Ny)
 
+    def model_rmse(self,phi_m,phi_ref):
+        step_ref = int(self.m_ref.Nx/self.m.Nx)
+        phi_m_r = ifft2(phi_m).real # back to physical space (real space)
+        phi_ref_r = ifft2(phi_ref).real
+        phi_ref_sub = phi_ref_r[::step_ref,::step_ref]
+        if phi_ref_sub.shape != phi_m_r.shape:
+            # Crop to the common overlap to prevent crash
+            limit = min(phi_ref_sub.shape[0], phi_m_r.shape[0])
+            phi_ref_sub = phi_ref_sub[:limit, :limit]
+            phi_m_r = phi_m_r[:limit, :limit]
+        diff = phi_m_r - phi_ref_sub
+        m_rmse = cp.sqrt(cp.mean(diff**2))
+
+        return m_rmse
     # def _block_intp(self):
     #     pass
     def create_nc(self,nf):
         self.m.create_nc(nf)
         self.cdaF_var = self.m.ds.createVariable('cdaF', 'f8', ('time', 'x', 'y'), zlib=False)
+        self.ihm_var = self.m.ds.createVariable('Ihm', 'f8', ('time', 'x', 'y'), zlib=False)
+        self.ihref_var = self.m.ds.createVariable('Ihref', 'f8', ('time', 'x', 'y'), zlib=False)
+        self.qrmse_var = self.m.ds.createVariable('qrmse', 'f8', ('time', 'x', 'y'), zlib=False)
         self.tecdak_var = self.m.ds.createVariable('tecdak', 'f8', ('time', 'k'), zlib=False)
         self.tzcdak_var = self.m.ds.createVariable('tzcdak', 'f8', ('time', 'k'), zlib=False)
         self.fecdak_var = self.m.ds.createVariable('fecdak', 'f8', ('time', 'k'), zlib=False)
@@ -80,6 +103,9 @@ class QGCDA:
         self.m.save_var(it)
         # cda term
         self.cdaF_var[it,:,:] = ifft2(self.m.cda_term).real.get()
+        self.ihm_var[it,:,:] = self.Ih_m.copy()
+        self.ihref_var[it,:,:] = self.Ih_ref.copy()
+        self.qrmse_var[it,:,:] = self.model_rmse(self.m.q_hat,self.m_ref.q_hat)
         self.tecdak_var[it,:], self.tzcdak_var[it,:],self.fecdak_var[it,:], self.fzcdak_var[it,:] = self.m.get_diagCda(self.m.p_hat,self.m.q_hat,self.m.cda_term)
         self.m.ds.sync()
     # def save_ref(self,ds):
@@ -106,13 +132,6 @@ class QGCDA:
         for n in range(total_steps+1):
             if n % self.intvl_cda == 0:
                 self._step_cda()
-            
-            
-            
-            if n % self.intvl_ref ==0:
-                self.m_ref._step_forward(scheme=scheme)
-                self.m_ref.t += self.m_ref.dt
-                self.m_ref.n_steps +=1
 
             if n % self.intvl_model ==0:
                 if self.m.n_steps % tsave == 0:
@@ -136,6 +155,10 @@ class QGCDA:
                 self.m.t += self.m.dt
                 self.m.n_steps += 1
 
+            if n % self.intvl_ref ==0:
+                self.m_ref._step_forward(scheme=scheme)
+                self.m_ref.t += self.m_ref.dt
+                self.m_ref.n_steps +=1
         self.m.ds.close()
         
         print('Done.')
