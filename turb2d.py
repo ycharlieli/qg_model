@@ -41,6 +41,8 @@ class QGModel:
         self.famp = famp
         self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
         self.cda_term = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
+        self.k1_p = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
+        self.k1_pp = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
         self.is_not_rst = True
         self._prebuild_operator()
         self._my_div()
@@ -329,6 +331,7 @@ class QGModel:
                 self.p_hat = self.inversion*self.q_hat
                 self.rv_hat= self.lap*self.p_hat
             elif q_ini.ndim == 3 :
+                self.is_not_rst = False
                 self.q_hat = q_ini[2,:,:].squeeze()
                 self.p_hat = self.inversion*self.q_hat
                 self.rv_hat= self.lap*self.p_hat
@@ -612,9 +615,9 @@ class QGModel:
         xs = self.rstds.createVariable('x', 'f8', ('x',))
         ys = self.rstds.createVariable('y', 'f8', ('y',))
         if self.ts_scheme  == 'rk4':
-            inds[:] = cp.array([0,])
+            inds[:] = np.array([0,])
         elif self.ts_scheme ==  'ab3':
-            inds[:] = cp.array([0,1,2])
+            inds[:] = np.array([0,1,2])
         xs[:] = self.x.get()
         ys[:] = self.y.get()
 
@@ -935,19 +938,20 @@ class QGModel:
                 insave +=1
 
             if self.n_steps % tsrst==0:
-                    if inrst == nrst:
-                        itrst =0 #time index -it
-                        if nfrst > 0 : self.rstds.close()
-                        self.create_rst(nfrst)
-                        insave=0 #save number index-in
-                        nfrst+=1
+                if inrst == nrst:
+                    itrst =0 #time index -it
+                    if nfrst > 0 : self.rstds.close()
+                    self.create_rst(nfrst)
+                    inrst=0 #save number index-in
+                    nfrst+=1
 
-                    self.save_rst(itrst)
-                    itrst +=1
-                    inrst +=1
+                self.save_rst(itrst)
+                itrst +=1
+                inrst +=1
             self._step_forward()
             self.t += self.dt
         self.ds.close()
+        self.rstds.close()
         print('Done.')
     
     # def cda_run(self,truth,...)
