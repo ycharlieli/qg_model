@@ -272,8 +272,9 @@ class QGModel:
             # initial potential vorticity (q)
             self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
         
-    def set_initial_condition(self,scheme='gauss',eini=0,q_ini=None,):
+    def set_initial_condition(self,scheme='gauss',eini=0,q_ini=None,trst=0):
         self.eini = eini
+        self.trst = trst
         if scheme == 'jcm1984':
             k_peak = 6
             # kk**(-A)*(1 + (kk/k0)**4)**(-B)
@@ -610,7 +611,7 @@ class QGModel:
             ind_dim = self.rstds.createDimension('ind', 3) 
         x_dim = self.rstds.createDimension('x', self.Nx)
         y_dim = self.rstds.createDimension('y', self.Ny)
-        self.rst_times = self.rstds.createVariable('rst_time', 'f8', ('time',))
+        self.rst_times = self.rstds.createVariable('time', 'f8', ('time',))
         inds = self.rstds.createVariable('ind', 'f8', ('ind',))
         xs = self.rstds.createVariable('x', 'f8', ('x',))
         ys = self.rstds.createVariable('y', 'f8', ('y',))
@@ -716,9 +717,13 @@ class QGModel:
         q_r = ifft2(self.q_hat).real.get()
         k1_p_r = ifft2(self.k1_p).real.get()
         k1_pp_r = ifft2(self.k1_pp).real.get()
-        self.qrst_var[it,0,:,:] = k1_pp_r
-        self.qrst_var[it,1,:,:] = k1_p_r
-        self.qrst_var[it,2,:,:] = q_r
+        self.rst_times[it] = self.t
+        if self.ts_scheme == 'ab3':
+            self.qrst_var[it,0,:,:] = k1_pp_r
+            self.qrst_var[it,1,:,:] = k1_p_r
+            self.qrst_var[it,2,:,:] = q_r
+        elif self.ts_scheme == 'rk4':
+            self.qrst_var[it,0,:,:] = q_r
         self.rstds.sync()
         del q_r, k1_p_r, k1_pp_r
         gc.collect()
@@ -911,7 +916,10 @@ class QGModel:
         self.ts_scheme = scheme
         self.tmax = tmax
         self.tsave = tsave
-        self.t = 0    
+        if self.trst:
+            self.t = self.trst
+        else:
+            self.t = 0    
         self.savedir = savedir
         os.makedirs(self.savedir, exist_ok=True)
         tsrst = int(1/self.dt) # save rst every 1  time unit timestep
@@ -931,7 +939,9 @@ class QGModel:
                 nf+=1
             if n%tsave == 0:
                 self.save_var(itsave)
-                print(f"step {n:7d}  t = {self.t:9.6f} s  E = {self.get_Etot(self.p_hat)/self.Nx/self.Ny:.4e}", end="\n")
+                E_crt = self.get_Etot(self.p_hat)/self.Nx/self.Ny
+                Vrms_crt = self.get_Vrms(self.p_hat)
+                print(f"   step {self.n_steps:7d}  t={self.t:9.6f}s E={E_crt:.4e} Vrms={Vrms_crt:.4e}", end="\n")
                 if saveplot:
                     self.plot_diag()
                 itsave +=1

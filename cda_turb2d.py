@@ -85,7 +85,7 @@ class QGCDA:
         diff = phi_m_r - phi_ref_sub
         m_rmse = cp.sqrt(cp.mean(diff**2))
 
-        return m_rmse
+        return m_rmse.get()
     # def _block_intp(self):
     #     pass
 
@@ -98,7 +98,7 @@ class QGCDA:
         self.cdaF_var = self.m.ds.createVariable('cdaF', 'f8', ('time', 'x', 'y'), zlib=False)
         self.ihm_var = self.m.ds.createVariable('Ihm', 'f8', ('time', 'x', 'y'), zlib=False)
         self.ihref_var = self.m.ds.createVariable('Ihref', 'f8', ('time', 'x', 'y'), zlib=False)
-        self.qrmse_var = self.m.ds.createVariable('qrmse', 'f8', ('time', 'x', 'y'), zlib=False)
+        self.qrmse_var = self.m.ds.createVariable('qrmse', 'f8', ('time',), zlib=False)
         self.tecdak_var = self.m.ds.createVariable('tecdak', 'f8', ('time', 'k'), zlib=False)
         self.tzcdak_var = self.m.ds.createVariable('tzcdak', 'f8', ('time', 'k'), zlib=False)
         self.fecdak_var = self.m.ds.createVariable('fecdak', 'f8', ('time', 'k'), zlib=False)
@@ -108,20 +108,20 @@ class QGCDA:
         self.m.save_var(it)
         # cda term
         self.cdaF_var[it,:,:] = ifft2(self.m.cda_term).real.get()
-        self.ihm_var[it,:,:] = self.Ih_m.copy()
-        self.ihref_var[it,:,:] = self.Ih_ref.copy()
-        self.qrmse_var[it,:,:] = self.model_rmse(self.m.q_hat,self.m_ref.q_hat)
+        self.ihm_var[it,:,:] = self.Ih_m.get()
+        self.ihref_var[it,:,:] = self.Ih_ref.get()
+        self.qrmse_var[it] = self.model_rmse(self.m.q_hat,self.m_ref.q_hat)
         self.tecdak_var[it,:], self.tzcdak_var[it,:],self.fecdak_var[it,:], self.fzcdak_var[it,:] = self.m.get_diagCda(self.m.p_hat,self.m.q_hat,self.m.cda_term)
         self.m.ds.sync()
     # def save_ref(self,ds):
 
 
 
-    def cda_run(self,scheme='ab3',trst=0,trst_ref= 0,tmax=40,tsave=200,nsave=100,savedir='run_cda0',saveplot=False):
+    def cda_run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,savedir='run_cda0',saveplot=False):
         self.m.ts_scheme     = scheme
         self.m_ref.ts_scheme = scheme
-        self.m.t = trst
-        self.m_ref.t = trst_ref   
+        self.m.t = self.m.trst
+        self.m_ref.t = self.m_ref.trst 
         self.m.is_not_rst = False
         self.m_ref.is_not_rst =False
         self.m.n_steps = 0
