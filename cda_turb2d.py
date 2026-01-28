@@ -88,6 +88,11 @@ class QGCDA:
         return m_rmse
     # def _block_intp(self):
     #     pass
+
+    
+        
+
+
     def create_nc(self,nf):
         self.m.create_nc(nf)
         self.cdaF_var = self.m.ds.createVariable('cdaF', 'f8', ('time', 'x', 'y'), zlib=False)
@@ -113,9 +118,12 @@ class QGCDA:
 
 
     def cda_run(self,scheme='ab3',trst=0,trst_ref= 0,tmax=40,tsave=200,nsave=100,savedir='run_cda0',saveplot=False):
-        
+        self.m.ts_scheme     = scheme
+        self.m_ref.ts_scheme = scheme
         self.m.t = trst
-        self.m_ref.t = trst_ref    
+        self.m_ref.t = trst_ref   
+        self.m.is_not_rst = False
+        self.m_ref.is_not_rst =False
         self.m.n_steps = 0
         self.m_ref.n_steps = 0
 
@@ -126,8 +134,13 @@ class QGCDA:
 
         print(f"Starting CDA. dTobs={self.dTobs}, tmax={tmax}")
         print(f"Step interval -> Model: {self.intvl_model}, Ref: {self.intvl_ref}, Obs: {self.intvl_cda}")
+
+        tsrst = int(1/self.m.dt) # save rst every 1  time unit timestep
+        nrst = nsave
         insave=nsave
+        inrst = nrst
         nf=0
+        nfrst=0
 
         for n in range(total_steps+1):
             if n % self.intvl_cda == 0:
@@ -137,10 +150,10 @@ class QGCDA:
                 if self.m.n_steps % tsave == 0:
 
                     if insave == nsave:
-                        itsave =0 #time index
+                        itsave =0 #time index -it
                         if nf > 0 : self.m.ds.close()
                         self.create_nc(nf)
-                        insave=0 #save number index
+                        insave=0 #save number index-in
                         nf+=1
                 
                     self.save_var(itsave)
@@ -151,12 +164,25 @@ class QGCDA:
                         self.m.plot_diag()
                     itsave +=1
                     insave +=1  
-                self.m._step_forward(scheme=scheme)
+                if self.m.n_steps % tsrst==0:
+                    if inrst == nrst:
+                        itrst =0 #time index -it
+                        if nfrst > 0 : self.m.rstds.close()
+                        self.create_rst(nfrst)
+                        insave=0 #save number index-in
+                        nfrst+=1
+
+                    self.save_rst(itrst)
+                    itrst +=1
+                    inrst +=1
+
+
+                self.m._step_forward()
                 self.m.t += self.m.dt
                 self.m.n_steps += 1
 
             if n % self.intvl_ref ==0:
-                self.m_ref._step_forward(scheme=scheme)
+                self.m_ref._step_forward()
                 self.m_ref.t += self.m_ref.dt
                 self.m_ref.n_steps +=1
         self.m.ds.close()

@@ -41,6 +41,7 @@ class QGModel:
         self.famp = famp
         self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
         self.cda_term = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
+        self.is_not_rst = True
         self._prebuild_operator()
         self._my_div()
         # gpu or cpu?  backend
@@ -173,7 +174,7 @@ class QGModel:
 
         return k1,k2,k3,k4
 
-    def _step_forward(self,scheme='ab3'):
+    def _step_forward(self):
         if self.forcing == 'wind':
             self._set_windforce()
         elif self.forcing =='thuburn':
@@ -182,25 +183,32 @@ class QGModel:
             self._update_markovforce()
         q = self.q_hat
 
-        if scheme=='rk4':
+        if self.ts_scheme=='rk4':
         # 4th order Runge-Kunta 
             k1,k2,k3,k4 = self._rk4(q)
             self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-        elif scheme == 'ab3':
+        elif self.ts_scheme == 'ab3':
         # 3rd order adambash forth
-            if self.n_steps == 0:
-                k1,k2,k3,k4 = self._rk4(q)
-                self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-                self.k1_pp = k1.copy()
-            elif self.n_steps == 1:
-                k1,k2,k3,k4 = self._rk4(q)
-                self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-                self.k1_p = k1.copy()
+            if is_not_rst:
+                if self.n_steps == 0:
+                    k1,k2,k3,k4 = self._rk4(q)
+                    self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+                    self.k1_pp = k1.copy()
+                elif self.n_steps == 1:
+                    k1,k2,k3,k4 = self._rk4(q)
+                    self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+                    self.k1_p = k1.copy()
+                else:
+                    k1 = self._get_rhs(q)
+                    self.q_hat = q + self.dt/12*(23*k1-16*self.k1_p+5*self.k1_pp)
+                    self.k1_pp = self.k1_p
+                    self.k1_p = k1.copy()
             else:
                 k1 = self._get_rhs(q)
                 self.q_hat = q + self.dt/12*(23*k1-16*self.k1_p+5*self.k1_pp)
                 self.k1_pp = self.k1_p
                 self.k1_p = k1.copy()
+
                 
 
         self.q_hat *=self.filtr
@@ -315,11 +323,20 @@ class QGModel:
             self.q_hat = self.rv_hat - self.gamma**2 * self.p_hat
         elif scheme == 'manual':
             # give initial q field manually
-            self.q_hat = q_ini.copy()
-            self.p_hat = self.inversion*self.q_hat
-            self.rv_hat= self.lap*self.p_hat
+            if q_ini.ndim == 2:
+
+                self.q_hat = q_ini.copy()
+                self.p_hat = self.inversion*self.q_hat
+                self.rv_hat= self.lap*self.p_hat
+            elif q_ini.ndim == 3 :
+                self.q_hat = q_ini[2,:,:].squeeze()
+                self.p_hat = self.inversion*self.q_hat
+                self.rv_hat= self.lap*self.p_hat
+                self.k1_p = q_ini[1,:,:].squeeze()
+                self.k1_pp  = q_ini[0,:,:].squeeze()
             if eini:
                 self._norm_energy()
+
         elif scheme == 'fromhr':
             fq_ini = fft2(cp.array(q_ini))
             hNx = q_ini.shape[0]
@@ -579,6 +596,45 @@ class QGModel:
         return tefilt_kk, tzfilt_kk, fefilt_kk, fzfilt_kk 
     
 ### save term   
+    def create_rst(self,nf):
+        outdir = self.savedir
+        nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
+        self.rstds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
+        time_dim = self.rstds.createDimension('time', None) 
+        if self.ts_scheme  == 'rk4':
+            ind_dim = self.rstds.createDimension('ind', 1) 
+        elif self.ts_scheme =  'ab3':
+            ind_dim = self.rstds.createDimension('ind', 3) 
+        x_dim = self.rstds.createDimension('x', self.Nx)
+        y_dim = self.rstds.createDimension('y', self.Ny)
+        self.rst_times = self.rstds.createVariable('rst_time', 'f8', ('time',))
+        inds = self.rstds.createVariable('ind', 'f8', ('ind',))
+        xs = self.rstds.createVariable('x', 'f8', ('x',))
+        ys = self.rstds.createVariable('y', 'f8', ('y',))
+        if self.ts_scheme  == 'rk4':
+            inds[:] = cp.array([0,])
+        elif self.ts_scheme =  'ab3':
+            inds[:] = cp.array([0,1,2])
+        xs[:] = self.x.get()
+        ys[:] = self.y.get()
+
+        self.qrst_var = self.rstds.createVariable('qrst', 'f8', ('time','ind', 'x', 'y'), zlib=False)
+
+        self.rstds.description = "QG Turbulence Simulation RST file"
+        self.rstds.dt = self.dt
+        self.rstds.Nx = self.Nx
+        self.rstds.Ny = self.Ny
+        self.rstds.Lx = self.Lx
+        self.rstds.Ly = self.Ly
+        self.rstds.ts_scheme = self.ts_scheme
+        self.rstds.kf = self.fscale
+        self.rstds.friction = self.friction
+        self.rstds.visc2 = self.visc2
+        self.rstds.hyvisc = self.hyvisc
+        self.rstds.gamma = self.gamma
+        self.rstds.beta = self.beta
+        self.rstds.cl = self.cl
+
     def create_nc(self,nf):
         outdir = self.savedir
         nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
@@ -644,6 +700,7 @@ class QGModel:
         self.ds.Ny = self.Ny
         self.ds.Lx = self.Lx
         self.ds.Ly = self.Ly
+        self.ds.ts_scheme = self.ts_scheme
         self.ds.kf = self.fscale
         self.ds.friction = self.friction
         self.ds.visc2 = self.visc2
@@ -651,6 +708,17 @@ class QGModel:
         self.ds.gamma = self.gamma
         self.ds.beta = self.beta
         self.ds.cl = self.cl
+
+    def save_rst(self,it):
+        q_r = ifft2(self.q_hat).real.get()
+        k1_p_r = ifft2(self.k1_p).real.get()
+        k1_pp_r = ifft2(self.k1_pp).real.get()
+        self.qrst_var[it,0,:,:] = k1_pp_r
+        self.qrst_var[it,1,:,:] = k1_p_r
+        self.qrst_var[it,2,:,:] = q_r
+        self.rstds.sync()
+        del q_r, k1_p_r, k1_pp_r
+        gc.collect()
 
 
     def save_var(self,it):
@@ -683,6 +751,7 @@ class QGModel:
         self.ds.sync()
         del q_r, p_r, rv_r
         gc.collect()
+        
 ### plot term     
     def plot_diag(self, save_path=None):
         """
@@ -836,6 +905,7 @@ class QGModel:
 
 ### run 
     def run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,savedir='run_0',saveplot=False):
+        self.ts_scheme = scheme
         self.tmax = tmax
         self.tsave = tsave
         self.t = 0    
@@ -861,7 +931,7 @@ class QGModel:
                 insave +=1
 
             
-            self._step_forward(scheme=scheme)
+            self._step_forward()
             self.t += self.dt
         self.ds.close()
         print('Done.')
