@@ -20,8 +20,6 @@ class QGCDA:
         self.interpolant =  interpolant
         self.Nobs = Nobs
         self.dTobs = dTobs
-        self.step_model = int(self.m.Nx/self.Nobs)
-        self.step_ref = int(self.m_ref.Nx/self.Nobs)
         self.dt = np.min([self.m.dt,self.m_ref.dt])
         self.intvl_model = int(round(self.m.dt/self.dt)) # check step instead time to avoid trunction error
         self.intvl_ref = int(round(self.m_ref.dt/self.dt))
@@ -32,20 +30,32 @@ class QGCDA:
     def _init_grid(self):
         self.x_obs = cp.linspace(0,self.m.Lx,self.Nobs) # position of observation
         self.y_obs = cp.linspace(0,self.m.Ly,self.Nobs)
-        x_model, y_model = cp.meshgrid(cp.arange(self.m.Nx),cp.arange(self.m.Ny))
+        x_model_idx, y_model_idx = cp.meshgrid(cp.arange(self.m.Nx),cp.arange(self.m.Ny))
         ratio = self.Nobs/self.m.Nx
-        rcoord_x =  x_model.ravel() * ratio# relative coordinate of model to observation
-        rcoord_y =  y_model.ravel() * ratio
+        rcoord_x =  x_model_idx.ravel() * ratio# relative coordinate of model to observation
+        rcoord_y =  y_model_idx.ravel() * ratio
         self.rcoord_model = cp.array([rcoord_y,rcoord_x])
+        x_obs_idx, y_obs_idx = cp.meshgrid(cp.arange(self.Nobs), cp.arange(self.Nobs))
         
+        scale_m = self.m.Nx / self.Nobs
+        ds_x_m = x_obs_idx * scale_m# Coordinates for Model -> Obs
+        ds_y_m = y_obs_idx * scale_m
+        self.coords_ds_m = cp.array([ds_y_m, ds_x_m])
+        
+        
+        scale_ref = self.m_ref.Nx / self.Nobs
+        ds_x_ref = x_obs_idx * scale_ref# Coordinates for Ref -> Obs
+        ds_y_ref = y_obs_idx * scale_ref
+        self.coords_ds_ref = cp.array([ds_y_ref, ds_x_ref])
 
     def _step_cda(self):
         #TODO currently only nudging vorticity
         q_m_r = ifft2(self.m.q_hat).real # back to physical space (real space)
         q_ref_r = ifft2(self.m_ref.q_hat).real
 
-        q_m_sub = q_m_r[::self.step_model,::self.step_model]
-        q_ref_sub = q_ref_r[::self.step_ref,::self.step_ref]
+        q_m_sub = map_coordinates(q_m_r,self.coords_ds_m,order=0, mode='wrap')
+        
+        q_ref_sub = map_coordinates(q_ref_r,self.coords_ds_ref,order=0,mode='wrap')
 
         q_m_sub = q_m_sub - cp.mean(q_m_sub) #zero correction for periodic domain
         q_ref_sub = q_ref_sub - cp.mean(q_ref_sub)

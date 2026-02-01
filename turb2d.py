@@ -627,7 +627,7 @@ class QGModel:
 ### save term   
     def create_rst(self,nf):
         outdir = self.savedir
-        if is_not_rst:
+        if self.is_not_rst:
             nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
         else:
             nc_filename = os.path.join(outdir, "rsted_%04d.nc"%(nf))
@@ -670,7 +670,7 @@ class QGModel:
 
     def create_nc(self,nf):
         outdir = self.savedir
-        if is_not_rst:
+        if self.is_not_rst:
             nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
         else:
             nc_filename = os.path.join(outdir, "output_%04d_rsted.nc"%(nf))
