@@ -31,7 +31,7 @@ class QGModel:
         self.friction = friction # large scale friction
         self.k_friction = k_friction 
         self.visc2 = visc2  #eddy viscosity
-        self.hyvisc = 10*1/(self.Nx*(2*cp.pi/self.Lx))**(hyperorder*2) # viscosity
+        self.hyvisc = 10*1/(self.Nx/2*(2*cp.pi/self.Lx))**(hyperorder*2) # viscosity t_eddy/kmax**(2n)
         self.hyperorder = hyperorder # order of hyper viscosity, 1-> Newnation 2-> biharmonic ...
         self.sp_filtr = sp_filtr # spectral filter impose on the tail of spectral (Arbic 2003)
         self.cl = cl #leith parameter
@@ -462,7 +462,10 @@ class QGModel:
         ene_tot = self.get_Etot(p_hat)
         vrms = np.sqrt(2*ene_tot/(self.Nx*self.Ny))
         return vrms
-
+    def get_Qrms(self,q_hat):
+        ens_tot = self.get_Ztot(q_hat)
+        qrms = np.sqrt(2*ens_tot/(self.Nx*self.Ny))
+        return qrms
     def get_Zk(self,q_hat):
         # Enstrophy density in spectral space
         ens_dens = 0.5*np.abs(q_hat)**2
@@ -661,7 +664,6 @@ class QGModel:
         ## diagonistic variable
         ## invariant quantities
         self.Etot_var = self.ds.createVariable('Etot', 'f8', ('time',))
-        self.Vrms_var = self.ds.createVariable('Vrms', 'f8', ('time',))
         self.Ztot_var = self.ds.createVariable('Ztot', 'f8', ('time',))
         self.Ek_var = self.ds.createVariable('Ek', 'f8', ('time', 'k'), zlib=False)
         self.Zk_var = self.ds.createVariable('Zk', 'f8', ('time', 'k'), zlib=False)
@@ -741,7 +743,6 @@ class QGModel:
         # diagnostic variable
         # invariant quantities
         self.Etot_var[it] = self.get_Etot(self.p_hat)
-        self.Vrms_var[it] = self.get_Vrms(self.p_hat)
         self.Ztot_var[it] = self.get_Ztot(self.q_hat)
         self.Ek_var[it,:] = self.get_Ek(self.p_hat) 
         self.Zk_var[it,:] = self.get_Zk(self.q_hat) 
@@ -941,7 +942,8 @@ class QGModel:
                 self.save_var(itsave)
                 E_crt = self.get_Etot(self.p_hat)/self.Nx/self.Ny
                 Vrms_crt = self.get_Vrms(self.p_hat)
-                print(f"   step {self.n_steps:7d}  t={self.t:9.6f}s E={E_crt:.4e} Vrms={Vrms_crt:.4e}", end="\n")
+                Qrms_crt = self.get_Qrms(self.q_hat)
+                print(f"   step {self.n_steps:7d}  t={self.t:9.6f}s E={E_crt:.4e} Vrms={Vrms_crt:.4e} Qrms={Qrms_crt:.4e}", end="\n")
                 if saveplot:
                     self.plot_diag()
                 itsave +=1
