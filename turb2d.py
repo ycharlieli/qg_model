@@ -350,16 +350,16 @@ class QGModel:
 
             if q_ini.ndim == 2:
 
-                self.q_hat = q_ini.copy()
+                self.q_hat = fft2(cp.array(q_ini.copy()))
                 self.p_hat = self.inversion*self.q_hat
                 self.rv_hat= self.lap*self.p_hat
             elif q_ini.ndim == 3 :
                 self.is_not_rst = False
-                self.q_hat = q_ini[2,:,:].squeeze()
+                self.q_hat = fft2(cp.array(q_ini[2,:,:].squeeze()))
                 self.p_hat = self.inversion*self.q_hat
                 self.rv_hat= self.lap*self.p_hat
-                self.k1_p = q_ini[1,:,:].squeeze()
-                self.k1_pp  = q_ini[0,:,:].squeeze()
+                self.k1_p = fft2(cp.array(q_ini[1,:,:].squeeze()))
+                self.k1_pp  = fft2(cp.array(q_ini[0,:,:].squeeze()))
             if eini:
                 self._norm_energy()
 
@@ -627,7 +627,10 @@ class QGModel:
 ### save term   
     def create_rst(self,nf):
         outdir = self.savedir
-        nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
+        if is_not_rst:
+            nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
+        else:
+            nc_filename = os.path.join(outdir, "rsted_%04d.nc"%(nf))
         self.rstds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
         time_dim = self.rstds.createDimension('time', None) 
         if self.ts_scheme  == 'rk4':
@@ -667,7 +670,10 @@ class QGModel:
 
     def create_nc(self,nf):
         outdir = self.savedir
-        nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
+        if is_not_rst:
+            nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
+        else:
+            nc_filename = os.path.join(outdir, "output_%04d_rsted.nc"%(nf))
         self.ds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
         time_dim = self.ds.createDimension('time', None) 
         x_dim = self.ds.createDimension('x', self.Nx)
@@ -954,7 +960,7 @@ class QGModel:
         nf=0
         nfrst=0
 
-        for n in range(int(tmax/self.dt)+1):
+        for n in range(int(tmax/self.dt)):
             self.n_steps = n
             if insave == nsave:
                 itsave =0 #time index

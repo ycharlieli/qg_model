@@ -122,8 +122,6 @@ class QGCDA:
         self.m_ref.ts_scheme = scheme
         self.m.t = self.m.trst
         self.m_ref.t = self.m_ref.trst 
-        self.m.is_not_rst = False
-        self.m_ref.is_not_rst =False
         self.m.n_steps = 0
         self.m_ref.n_steps = 0
 
@@ -142,7 +140,7 @@ class QGCDA:
         nf=0
         nfrst=0
 
-        for n in range(total_steps+1):
+        for n in range(total_steps):
             if n % self.intvl_cda == 0:
                 self._step_cda()
 
