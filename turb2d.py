@@ -31,7 +31,10 @@ class QGModel:
         self.friction = friction # large scale friction
         self.k_friction = k_friction 
         self.visc2 = visc2  #eddy viscosity
-        self.hyvisc = 10*1/(self.Nx/2*(2*cp.pi/self.Lx))**(hyperorder*2) # viscosity t_eddy/kmax**(2n)
+        if hyperorder == 1:
+            self.hyvisc = self.visc2
+        else:
+            self.hyvisc = 10*1/(self.Nx/2*(2*cp.pi/self.Lx))**(hyperorder*2) # viscosity t_eddy/kmax**(2n)
         self.hyperorder = hyperorder # order of hyper viscosity, 1-> Newnation 2-> biharmonic ...
         self.sp_filtr = sp_filtr # spectral filter impose on the tail of spectral (Arbic 2003)
         self.cl = cl #leith parameter
@@ -163,7 +166,7 @@ class QGModel:
         rv_hat = q_hat + self.gamma**2*p_hat
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
         beta_term = self.beta*self.kx2d*1j*p_hat
-        damping_term = (-self.friction_mask*self.friction + self.visc2*self.lap+ self.hylap)*rv_hat
+        damping_term = (-self.friction_mask*self.friction + self.hylap)*rv_hat
         damping_term+=self._compute_leith_term()
         
         return -jacobian_term-beta_term+damping_term+self.force_q+self.cda_term
@@ -256,7 +259,20 @@ class QGModel:
         
 
         return flux_x_hat+flux_y_hat
-    # def upscale(self,Nxup,Nyup):
+
+    #TODO self spec_pad
+    
+
+    def spec_cut(self,phi_hat):
+        hNx = phi_hat.shape[0] 
+        hNy = phi_hat.shape[1]
+        hx0 = int((hNx-self.Nx)/2)
+        hx1 = hx0+self.Nx
+        hy0 = int((hNy-self.Ny)/2)
+        hy1 = hy0+self.Ny
+        phi_cut = fftshift(fftshift(phi_hat)[hx0:hx1,hy0:hy1])
+        return phi_cut        
+
 
 ### initial term
     def _norm_energy(self):
@@ -324,8 +340,14 @@ class QGModel:
                 
             self.rv_hat = self.lap * self.p_hat
             self.q_hat = self.rv_hat - self.gamma**2 * self.p_hat
-        elif scheme == 'manual':
+        elif scheme == 'rst':
             # give initial q field manually
+            # if q_ini[:,:,0].shape[0] > self.Nx:
+            #     # high res ini spectral cut
+            #     q_ini = self.spec_cut(q_ini)
+                
+
+
             if q_ini.ndim == 2:
 
                 self.q_hat = q_ini.copy()
@@ -569,9 +591,9 @@ class QGModel:
 
     def get_diagVisc(self, p_hat, q_hat):
         # spectral energy transfer of viscosity
-        tevisc = -cp.real(cp.conj(p_hat)*(self.visc2*self.lap+self.hylap)*q_hat) #TODO add parameterized term (Leith)
+        tevisc = -cp.real(cp.conj(p_hat)*(self.hylap)*q_hat+self._compute_leith_term()) #TODO add parameterized term (Leith)
         # spectral enstrophy transfer of viscosity
-        tzvisc = cp.real(cp.conj(q_hat)*(self.visc2*self.lap+self.hylap)*q_hat)
+        tzvisc = cp.real(cp.conj(q_hat)*(self.hylap)*q_hat+self._compute_leith_term())
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer of viscosity
         # In physical space 
@@ -636,6 +658,7 @@ class QGModel:
         self.rstds.ts_scheme = self.ts_scheme
         self.rstds.kf = self.fscale
         self.rstds.friction = self.friction
+        self.rstds.hyperorder=self.hyperorder
         self.rstds.visc2 = self.visc2
         self.rstds.hyvisc = self.hyvisc
         self.rstds.gamma = self.gamma
@@ -708,6 +731,7 @@ class QGModel:
         self.ds.Ly = self.Ly
         self.ds.ts_scheme = self.ts_scheme
         self.ds.kf = self.fscale
+        self.ds.hyperorder=self.hyperorder
         self.ds.friction = self.friction
         self.ds.visc2 = self.visc2
         self.ds.hyvisc = self.hyvisc
