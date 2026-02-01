@@ -147,16 +147,8 @@ class QGCDA:
         nrst = nsave
         insave=nsave
         inrst = nrst
-        
-        if is_not_rst:
-            nf0=0
-            nfrst0=0
-        else:
-
-            nf0 = int(self.m.trst/self.m.dt/tsave/nsave)
-            nfrst0 = int(self.trst/nsave)
-        nf = nf0
-        nfrst = nfrst0
+        nf=0
+        nfrst=0
 
         for n in range(total_steps):
             if n % self.intvl_cda == 0:
@@ -167,14 +159,8 @@ class QGCDA:
 
                     if insave == nsave:
                         itsave =0 #time index -it
-                        if nf > nf0 : 
-                            self.m.ds.close()
-                            self.create_nc(nf)
-                        else:
-                            if nf0:
-                                self.m.resume_nc(nf)
-                            else:
-                                self.create_nc(nf)
+                        if nf > 0 : self.m.ds.close()
+                        self.create_nc(nf)
                         insave=0 #save number index-in
                         nf+=1
                 
@@ -189,7 +175,7 @@ class QGCDA:
                 if self.m.n_steps % tsrst==0:
                     if inrst == nrst:
                         itrst =0 #time index -it
-                        if nfrst > nfrst0 : self.m.rstds.close()
+                        if nfrst > 0 : self.m.rstds.close()
                         self.m.create_rst(nfrst)
                         insave=0 #save number index-in
                         nfrst+=1
