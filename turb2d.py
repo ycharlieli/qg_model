@@ -625,12 +625,14 @@ class QGModel:
         return tefilt_kk, tzfilt_kk, fefilt_kk, fzfilt_kk 
     
 ### save term   
+    def resume_rst(self,nf):
+        outdir = self.savedir
+        nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
+        self.ds = nc.Dataset(nc_filename, 'a', format='NETCDF4')
+
     def create_rst(self,nf):
         outdir = self.savedir
-        if self.is_not_rst:
-            nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
-        else:
-            nc_filename = os.path.join(outdir, "rsted_%04d.nc"%(nf))
+        nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
         self.rstds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
         time_dim = self.rstds.createDimension('time', None) 
         if self.ts_scheme  == 'rk4':
@@ -667,13 +669,14 @@ class QGModel:
         self.rstds.gamma = self.gamma
         self.rstds.beta = self.beta
         self.rstds.cl = self.cl
+    def resume_nc(self,nf):
+        outdir = self.savedir
+        nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
+        self.ds = nc.Dataset(nc_filename, 'a', format='NETCDF4')
 
     def create_nc(self,nf):
         outdir = self.savedir
-        if self.is_not_rst:
-            nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
-        else:
-            nc_filename = os.path.join(outdir, "output_%04d_rsted.nc"%(nf))
+        nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
         self.ds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
         time_dim = self.ds.createDimension('time', None) 
         x_dim = self.ds.createDimension('x', self.Nx)
@@ -957,15 +960,27 @@ class QGModel:
         nrst = nsave
         insave=nsave
         inrst = nrst
-        nf=0
-        nfrst=0
+        if is_not_rst:
+            nf0=0
+            nfrst0=0
+        else:
+            nf0 = int(self.m.trst/self.m.dt/tsave/nsave)
+            nfrst0 = int(self.trst/nsave)
+        nf = nf0
+        nfrst = nfrst0
 
         for n in range(int(tmax/self.dt)):
             self.n_steps = n
             if insave == nsave:
                 itsave =0 #time index
-                if nf > 0 : self.ds.close()
-                self.create_nc(nf)
+                if nf > nf0 : 
+                    self.ds.close()
+                    self.create_nc(nf)
+                else:
+                    if nf0:
+                        self.resume_nc(nf)
+                    else:
+                        self.create_nc(nf)
                 insave=0 #save number index
                 nf+=1
             if n%tsave == 0:
@@ -982,8 +997,14 @@ class QGModel:
             if self.n_steps % tsrst==0:
                 if inrst == nrst:
                     itrst =0 #time index -it
-                    if nfrst > 0 : self.rstds.close()
-                    self.create_rst(nfrst)
+                    if nfrst > nfrst0 : 
+                        self.rstds.close()
+                        self.create_rst(nfrst)
+                    else:
+                        if nfrst0:
+                            self.resume_rst(nfrst)
+                        else:
+                            self.create_nc(nfrst)
                     inrst=0 #save number index-in
                     nfrst+=1
 
