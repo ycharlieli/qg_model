@@ -14,23 +14,42 @@ import netCDF4 as nc
 import os
 
 class QGModel:
-    # 2d turbulence model
+    """2D Quasi-Geostrophic turbulence model with spectral methods"""
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
                  beta=0, gamma=0, 
                  friction=0.01,k_friction = 20000,visc2 = 0,hyperorder=1,sp_filtr=False,cl=0,
                  forcing=None,fscale=4,finput=3,famp=1.):
+        """Initialize QG model with grid and parameters
+        
+        Args:
+            Nx, Ny: Grid dimensions
+            Lx, Ly: Domain sizes
+            dt: Time step
+            beta: Beta parameter (Coriolis gradient)
+            gamma: Stratification parameter
+            friction: Friction coefficient
+            k_friction: Wavenumber cutoff for friction
+            visc2: Eddy viscosity coefficient
+            hyperorder: Order of hyperviscosity (1=Laplacian, 2=Biharmonic, etc.)
+            sp_filtr: Whether to apply spectral filter
+            cl: Leith parameter for biharmonic viscosity
+            forcing: Forcing type ('wind', 'thuburn', 'markov', None)
+            fscale: Forcing wavenumber scale
+            finput: Forcing enstrophy injection rate
+            famp: Forcing amplitude
+        """
         self.Nx = Nx
         self.Ny = Ny
         self.Lx = Lx
         self.Ly = Ly
         self.dt = dt
         self._init_grid()
-        # parameter of qg
-        self.beta = beta
-        self.gamma = gamma
+        # QG parameters
+        self.beta = beta # Coriolis gradient
+        self.gamma = gamma # stratification parameter
         self.friction = friction # large scale friction
-        self.k_friction = k_friction 
-        self.visc2 = visc2  #eddy viscosity
+        self.k_friction = k_friction # wavenumber cutoff for friction
+        self.visc2 = visc2 # eddy viscosity
         if hyperorder == 1:
             self.hyvisc = self.visc2
         else:
@@ -52,18 +71,20 @@ class QGModel:
         # gpu or cpu?  backend
 ### private term
     def _init_grid(self):
+        """Initialize computational grid and wavenumber arrays"""
         self.x = cp.linspace(0,self.Lx,self.Nx)
         self.y = cp.linspace(0,self.Ly,self.Ny)
         self.x2d, self.y2d = cp.meshgrid(self.x,self.y)
-        # Grid indices
-        nx = cp.arange(self.Nx); nx[int(self.Nx/2):] -= self.Nx # or np.fft.fftfreq(Nx)*Nx
+        # Grid indices for FFT
+        nx = cp.arange(self.Nx); nx[int(self.Nx/2):] -= self.Nx # shift for proper wavenumbers
         ny = cp.arange(self.Ny); ny[int(self.Ny/2):] -= self.Ny
         self.nx2d, self.ny2d = cp.meshgrid(nx,ny)
+        # Wavenumbers
         kx = 2*cp.pi*nx/self.Lx
         ky = 2*cp.pi*ny/self.Ly
-        # get the 2d wavenumber
+        # 2D wavenumber arrays
         self.kx2d, self.ky2d = cp.meshgrid(kx,ky) 
-        # get K, i.e. 2d isotropic wave number 
+        # 2D isotropic wavenumber magnitude
         self.kk = cp.sqrt(self.kx2d**2+self.ky2d**2) 
 
         # self.kk_intvl = cp.round(self.kk).astype('int')
@@ -76,10 +97,10 @@ class QGModel:
         self.kk_range = self.kk_idx_set < int(self.Nx/2)
         self.kk_iso = self.kk_set[self.kk_range]
     def _init_friction(self):
-        # Only apply drag to large-scale modes (k <= 4) to stop the condensate
+        """Initialize friction mask for large-scale modes"""
         self.friction_mask = cp.zeros_like(self.kk)
-        self.friction_mask[self.kk <= self.k_friction] = 1
-        self.friction_mask[0,0] = 1 # Handle mean flow
+        self.friction_mask[self.kk <= self.k_friction] = 1 # apply friction to large scales
+        self.friction_mask[0,0] = 1 # handle mean flow
 
     def _init_filter(self):
         #"""Set up frictional filter (Arbic and Flierl, 2004)."""
@@ -161,17 +182,21 @@ class QGModel:
 
         
     def _get_rhs(self,q_hat):
+        """Compute right-hand side of QG dynamics equation
         
-        p_hat = self.inversion*q_hat
-        rv_hat = q_hat + self.gamma**2*p_hat
+        Returns the tendency from all processes: advection, beta effect, damping
+        """
+        p_hat = self.inversion*q_hat # invert to get streamfunction
+        rv_hat = q_hat + self.gamma**2*p_hat # relative vorticity
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
         beta_term = self.beta*self.kx2d*1j*p_hat
         damping_term = (-self.friction_mask*self.friction + self.hylap)*rv_hat
-        damping_term+=self._compute_leith_term()
+        damping_term+=self._compute_leith_term(rv_hat)
         
         return -jacobian_term-beta_term+damping_term+self.force_q+self.cda_term
 
     def _rk4(self, q_hat):
+        """Compute 4th order Runge-Kutta stages"""
         k1 = self._get_rhs(q_hat)
         k2 = self._get_rhs(q_hat + 0.5 * self.dt * k1)
         k3 = self._get_rhs(q_hat + 0.5 * self.dt * k2)
@@ -180,6 +205,7 @@ class QGModel:
         return k1,k2,k3,k4
 
     def _step_forward(self):
+        """Advance simulation one time step using specified scheme"""
         if self.forcing == 'wind':
             self._set_windforce()
         elif self.forcing =='thuburn':
@@ -189,16 +215,16 @@ class QGModel:
         q = self.q_hat
 
         if self.ts_scheme=='rk4':
-        # 4th order Runge-Kunta 
+            # 4th order Runge-Kutta integration
             k1,k2,k3,k4 = self._rk4(q)
             self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
         elif self.ts_scheme == 'ab3':
-        # 3rd order adambash forth
+            # 3rd order Adams-Bashforth integration
             if self.is_not_rst:
                 if self.n_steps == 0:
                     k1,k2,k3,k4 = self._rk4(q)
                     self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-                    self.k1_pp = k1.copy()
+                    self.k1_pp = k1.copy() # store RHS history for AB3
                 elif self.n_steps == 1:
                     k1,k2,k3,k4 = self._rk4(q)
                     self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
@@ -214,19 +240,21 @@ class QGModel:
                 self.k1_pp = self.k1_p
                 self.k1_p = k1.copy()
 
-                
-
-        self.q_hat *=self.filtr
+        self.q_hat *=self.filtr # apply spectral filter
         self.p_hat = self.inversion*self.q_hat
         self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
         
     
     def _compute_jacobian(self,p_hat,q_hat):
+        """Compute Jacobian term for non-linear advection with dealiasing
+        
+        Uses 3/2-rule padding to avoid aliasing errors in spectral computation
+        """
         dxp_hat = self.kx2d*1j*p_hat
         dyp_hat = self.ky2d*1j*p_hat
         dxq_hat = self.kx2d*1j*q_hat
         dyq_hat = self.ky2d*1j*q_hat
-        # zeropadding to subsample with the high frequency to avoid aliasing 
+        # Zero-padding with 3/2 rule to remove aliasing
         dxq_r = ifft2(self._padding(dxq_hat)).real
         dyq_r = ifft2(self._padding(dyq_hat)).real
         dxp_r = ifft2(self._padding(dxp_hat)).real
@@ -238,9 +266,16 @@ class QGModel:
     
         return jacob_hat
 
-    def _compute_leith_term(self):
-        dxrv_hat = self.kx2d*1j*self.rv_hat
-        dyrv_hat = self.ky2d*1j*self.rv_hat
+    def _compute_leith_term(self, rv_hat=None):
+        """Compute biharmonic Leith viscosity term
+        
+        Args:
+            rv_hat: Relative vorticity in Fourier space (uses current value if None)
+        """
+        if rv_hat is None:
+            rv_hat = self.rv_hat # use current value for stable stepping
+        dxrv_hat = self.kx2d*1j*rv_hat
+        dyrv_hat = self.ky2d*1j*rv_hat
         
         dxrv_r = ifft2(self._padding(dxrv_hat)).real
         dyrv_r = ifft2(self._padding(dyrv_hat)).real
@@ -248,15 +283,13 @@ class QGModel:
         grad_rv_r = cp.sqrt(dxrv_r**2+dyrv_r**2)
         
         nabla = self.Lx/self.Nx
-        nu_e = (self.cl*nabla)**3*grad_rv_r
+        nu_e = (self.cl*nabla)**3*grad_rv_r # eddy viscosity
         
         flux_x_r = nu_e*dxrv_r
         flux_y_r = nu_e*dyrv_r
 
         flux_x_hat = self.kx2d*1j*self._unpadding(fft2(flux_x_r))
         flux_y_hat = self.ky2d*1j*self._unpadding(fft2(flux_y_r))
-
-        
 
         return flux_x_hat+flux_y_hat
 
@@ -442,8 +475,11 @@ class QGModel:
         self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
 
     def _update_markovforce(self):
-        #  Generate Random Noise (ei\theta)
-        # print(self.fseed)
+        """Update Markovian stochastic forcing with temporal correlation
+        
+        Uses correlated noise to maintain consistent forcing amplitude
+        """
+        # Generate random noise
         cp.random.seed(self.fseed)
         if self.fseed < 42:
             self.fseed +=1
@@ -452,67 +488,72 @@ class QGModel:
         noise_phys = cp.random.randn(self.Nx, self.Ny)
         noise_hat = fft2(noise_phys)
         
-        #  Apply Spectral Mask
+        # Apply spectral mask to specific wavenumber shell
         noise_hat *= self.fmask
         
-        #  Markov Update 
-        # self.force_q currently holds F_{n-1}
+        # Markov update with temporal correlation (F_n = a*noise + r*F_{n-1})
         self.force_q = (self.fcoef * noise_hat) + (self.fR * self.force_q)
-        # energt fixer
-        # inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * self.force_q)) / (self.Nx * self.Ny)**2 # energy injection
-        # # print(inputF)
-        # if inputF > self.finput:
-        #     norm_fac = 1.*(self.finput)/(inputF)
-        #     self.force_q *= norm_fac
 
 ## diagnostic term
     def get_Ek(self,p_hat):
-        # Isotropic Energy spectrum
+        """Compute isotropic energy spectrum
+        
+        Integrates energy density in spectral shells using Parseval's theorem
+        """
         # Energy density in spectral space
-        ene_dens = 0.5*self.kk**2*cp.abs(p_hat)**2
+        ene_dens = 0.5*(self.kk**2+self.gamma**2)*cp.abs(p_hat)**2
         # Physical space using Parseval's Theorem
         norm_fac = 1/(self.Nx*self.Ny)
         ene_kk = npg.aggregate(self.kk_idx.ravel().get(),ene_dens.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         return ene_kk
     def get_Etot(self,p_hat):
-        # Total Energy
+        """Compute total energy"""
         ene_kk = self.get_Ek(p_hat)
         ene_tot = np.sum(ene_kk) 
         return ene_tot
 
     def get_Vrms(self,p_hat):
+        """Compute RMS velocity"""
         ene_tot = self.get_Etot(p_hat)
         vrms = np.sqrt(2*ene_tot/(self.Nx*self.Ny))
         return vrms
     def get_Qrms(self,q_hat):
+        """Compute RMS potential vorticity"""
         ens_tot = self.get_Ztot(q_hat)
         qrms = np.sqrt(2*ens_tot/(self.Nx*self.Ny))
         return qrms
     def get_Zk(self,q_hat):
+        """Compute isotropic enstrophy spectrum"""
         # Enstrophy density in spectral space
         ens_dens = 0.5*np.abs(q_hat)**2
         norm_fac = 1/(self.Nx*self.Ny)
-        # isotropic enstrophy spectrum in physical space using Parseval's Theorem
+        # Isotropic enstrophy spectrum in physical space using Parseval's Theorem
         ens_kk = npg.aggregate(self.kk_idx.ravel().get(),ens_dens.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         return ens_kk
     def get_Ztot(self,q_hat):
-        # Total Enstrophy
+        """Compute total enstrophy"""
         ens_kk = self.get_Zk(q_hat)
         ens_tot = np.sum(ens_kk)
         return ens_tot
     def get_TENL(self,p_hat,q_hat):
+        """Compute spectral energy transfer from non-linear advection"""
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
-        # spectral energy transfer of non-linear advection
+        # Energy transfer: T_E = -Re(p* * J)
         tenl = cp.real(cp.conj(p_hat)*jacobian_term)
         return tenl
     
     def get_TZNL(self,p_hat,q_hat):
+        """Compute spectral enstrophy transfer from non-linear advection"""
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
-        # spectral enstrophy transfer of non-linear advection
+        # Enstrophy transfer: T_Z = -Re(q* * J)
         tznl = -cp.real(cp.conj(q_hat)*jacobian_term)
         return tznl
 
     def get_diagNL(self,p_hat,q_hat):
+        """Compute energy and enstrophy budgets from non-linear advection
+        
+        Returns spectral transfer and flux for both quantities
+        """
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
         # spectral energy transfer of non-linear advection
         tenl = cp.real(cp.conj(p_hat)*jacobian_term)
@@ -520,7 +561,7 @@ class QGModel:
         tznl = -cp.real(cp.conj(q_hat)*jacobian_term)
 
         # Isotropic spectrum of energy transfer of non-linear advection 
-        # In physical space 
+        # In physical space using spectral aggregation
         norm_fac = 1/(self.Nx*self.Ny)
         tenl_kk = npg.aggregate(self.kk_idx.ravel().get(),tenl.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of enstrophy transfer of non-linear advection
@@ -534,15 +575,19 @@ class QGModel:
         return tenl_kk, tznl_kk, fenl_kk, fznl_kk
 
     def get_diagF(self,p_hat,q_hat,force_q):
+        """Compute energy and enstrophy budgets from forcing
+        
+        Returns spectral transfer and flux for both quantities
+        """
         # spectral energy transfer of forcing
         teF = -cp.real(cp.conj(p_hat)*force_q)
-        # spectral enstrophy transfoer of forcing
+        # spectral enstrophy transfer of forcing
         tzF = cp.real(cp.conj(q_hat)*force_q)
         norm_fac = 1/(self.Nx*self.Ny)
-        # Isotropic spectrum of energy transfer of non-linear advection
-        # In physical space 
+        # Isotropic spectrum of energy transfer 
+        # In physical space using spectral aggregation
         teF_kk = npg.aggregate(self.kk_idx.ravel().get(),teF.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer of non-linear advection
+        # Isotropic spectrum of enstrophy transfer 
         # In physical space 
         tzF_kk =npg.aggregate(self.kk_idx.ravel().get(),tzF.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of energy flux of forcing
@@ -553,32 +598,40 @@ class QGModel:
         return teF_kk, tzF_kk, feF_kk, fzF_kk
 
     def get_diagCda(self,p_hat,q_hat,cda_term):
-        # spectral energy transfer of forcing
+        """Compute energy and enstrophy budgets from data assimilation nudging
+        
+        Returns spectral transfer and flux for both quantities
+        """
+        # spectral energy transfer of CDA
         tecda = -cp.real(cp.conj(p_hat)*cda_term)
-        # spectral enstrophy transfoer of forcing
+        # spectral enstrophy transfer of CDA
         tzcda = cp.real(cp.conj(q_hat)*cda_term)
         norm_fac = 1/(self.Nx*self.Ny)
-        # Isotropic spectrum of energy transfer of non-linear advection
-        # In physical space 
+        # Isotropic spectrum of energy transfer 
+        # In physical space using spectral aggregation
         tecda_kk = npg.aggregate(self.kk_idx.ravel().get(),tecda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer of non-linear advection
+        # Isotropic spectrum of enstrophy transfer 
         # In physical space 
         tzcda_kk =npg.aggregate(self.kk_idx.ravel().get(),tzcda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of energy flux of forcing
+        # Isotropic spectrum of energy flux
         fecda_kk = np.cumsum(tecda_kk[::-1])[::-1]
-        # Isotropic spectrum of enstrophy flux of forcing
+        # Isotropic spectrum of enstrophy flux
         fzcda_kk = np.cumsum(tzcda_kk[::-1])[::-1]
 
         return tecda_kk, tzcda_kk, fecda_kk, fzcda_kk
 
     def get_diagFric(self,p_hat,q_hat):
+        """Compute energy and enstrophy dissipation from large-scale friction
+        
+        Returns spectral dissipation and flux for both quantities
+        """
         # spectral energy transfer of friction
         tefric = -2*self.friction_mask*self.friction* 0.5*self.kk**2*cp.abs(p_hat)**2
         # spectral enstrophy transfer of friction
         tzfric = -2*self.friction_mask*self.friction* 0.5*cp.abs(q_hat)**2
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer of friction
-        # In physical space 
+        # In physical space using spectral aggregation
         tefric_kk = npg.aggregate(self.kk_idx.ravel().get(),tefric.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of enstrophy transfer of friction
         # In physical space 
@@ -590,48 +643,68 @@ class QGModel:
         return tefric_kk, tzfric_kk, fefric_kk, fzfric_kk
 
     def get_diagVisc(self, p_hat, q_hat):
+        """Compute energy and enstrophy dissipation from hyperviscosity
+        
+        Returns spectral dissipation and flux for both quantities
+        """
+        rv_hat = q_hat + self.gamma**2*p_hat
         # spectral energy transfer of viscosity
-        tevisc = -cp.real(cp.conj(p_hat)*(self.hylap)*q_hat+self._compute_leith_term()) #TODO add parameterized term (Leith)
+        tevisc = -cp.real(cp.conj(p_hat)*(self.hylap*rv_hat+self._compute_leith_term(rv_hat)))
         # spectral enstrophy transfer of viscosity
-        tzvisc = cp.real(cp.conj(q_hat)*(self.hylap)*q_hat+self._compute_leith_term())
+        tzvisc = cp.real(cp.conj(q_hat)*(self.hylap*rv_hat+self._compute_leith_term(rv_hat)))
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer of viscosity
-        # In physical space 
+        # In physical space using spectral aggregation
         tevisc_kk = npg.aggregate(self.kk_idx.ravel().get(),tevisc.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer of friction
+        # Isotropic spectrum of enstrophy transfer of viscosity
         # In physical space 
         tzvisc_kk = npg.aggregate(self.kk_idx.ravel().get(),tzvisc.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of energy flux of friction
+        # Isotropic spectrum of energy flux of viscosity
         fevisc_kk = np.cumsum(tevisc_kk[::-1])[::-1]
-        # Isotropic spectrum of enstrophy flux of friction
+        # Isotropic spectrum of enstrophy flux of viscosity
         fzvisc_kk = np.cumsum(tzvisc_kk[::-1])[::-1]
         return tevisc_kk, tzvisc_kk, fevisc_kk, fzvisc_kk
 
     def get_diagFilt(self,p_hat,q_hat):
+        """Compute energy and enstrophy loss from spectral filter
+        
+        Returns spectral dissipation and flux for both quantities
+        """
         filt_rate = (self.filtr - 1.) / self.dt
+        # spectral energy transfer of filter
         tefilt = -cp.real(cp.conj(p_hat) * filt_rate*q_hat)
+        # spectral enstrophy transfer of filter
         tzfilt = cp.real(cp.conj(q_hat) * filt_rate*q_hat)
         norm_fac = 1/(self.Nx*self.Ny)
-        # Isotropic spectrum of energy transfer of friction
-        # In physical space 
+        # Isotropic spectrum of energy transfer of filter
+        # In physical space using spectral aggregation
         tefilt_kk = npg.aggregate(self.kk_idx.ravel().get(),tefilt.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer of friction
+        # Isotropic spectrum of enstrophy transfer of filter
         # In physical space 
         tzfilt_kk = npg.aggregate(self.kk_idx.ravel().get(),tzfilt.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of energy flux of friction
+        # Isotropic spectrum of energy flux of filter
         fefilt_kk = np.cumsum(tefilt_kk[::-1])[::-1]
-        # Isotropic spectrum of enstrophy flux of friction
+        # Isotropic spectrum of enstrophy flux of filter
         fzfilt_kk = np.cumsum(tzfilt_kk[::-1])[::-1]
         return tefilt_kk, tzfilt_kk, fefilt_kk, fzfilt_kk 
     
-### save term   
+    # Save and output methods
     def create_rst(self,nf):
+        """Create NetCDF file for model state restart data
+        
+        Stores full vorticity field and time indices for RK4 or AB3 continuation
+        
+        Args:
+            nf: File counter for restart checkpoint numbering
+        """
         outdir = self.savedir
+        # Create restart filename with counter
         if self.is_not_rst:
             nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
         else:
             nc_filename = os.path.join(outdir, "rst_r%04d.nc"%(nf))
         self.rstds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
+        # Create dimensions for time, integration scheme index, and spatial grid
         time_dim = self.rstds.createDimension('time', None) 
         if self.ts_scheme  == 'rk4':
             ind_dim = self.rstds.createDimension('ind', 1) 
@@ -639,19 +712,24 @@ class QGModel:
             ind_dim = self.rstds.createDimension('ind', 3) 
         x_dim = self.rstds.createDimension('x', self.Nx)
         y_dim = self.rstds.createDimension('y', self.Ny)
+        # Create coordinate variables
         self.rst_times = self.rstds.createVariable('time', 'f8', ('time',))
         inds = self.rstds.createVariable('ind', 'f8', ('ind',))
         xs = self.rstds.createVariable('x', 'f8', ('x',))
         ys = self.rstds.createVariable('y', 'f8', ('y',))
+        # Initialize time step indices based on integration scheme
         if self.ts_scheme  == 'rk4':
             inds[:] = np.array([0,])
         elif self.ts_scheme ==  'ab3':
             inds[:] = np.array([0,1,2])
+        # Set spatial coordinates from GPU arrays
         xs[:] = self.x.get()
         ys[:] = self.y.get()
 
-        self.qrst_var = self.rstds.createVariable('qrst', 'f8', ('time','ind', 'x', 'y'), zlib=False)
+        # Create data variable for vorticity field
+        self.qrst_var = self.rstds.createVariable('qrst', 'f8', ('time','ind', 'y', 'x'), zlib=False)
 
+        # Store simulation parameters as global attributes
         self.rstds.description = "QG Turbulence Simulation RST file"
         self.rstds.dt = self.dt
         self.rstds.Nx = self.Nx
@@ -669,27 +747,39 @@ class QGModel:
         self.rstds.cl = self.cl
 
     def create_nc(self,nf):
+        """Create NetCDF file for output diagnostics
+        
+        Initializes file with dimensions and coordinate variables for diagnostics output
+        
+        Args:
+            nf: File counter for output numbering
+        """
         outdir = self.savedir
+        # Create output filename with counter
         if self.is_not_rst:
             nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
         else:
             nc_filename = os.path.join(outdir, "output_r%04d.nc"%(nf))
         self.ds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
+        # Create dimensions for time, spatial grid, and wavenumber spectrum
         time_dim = self.ds.createDimension('time', None) 
         x_dim = self.ds.createDimension('x', self.Nx)
         y_dim = self.ds.createDimension('y', self.Ny)
         k_dim = self.ds.createDimension('k',len(self.kk_iso))
+        # Create coordinate variables
         self.times = self.ds.createVariable('time', 'f8', ('time',))
         xs = self.ds.createVariable('x', 'f8', ('x',))
         ys = self.ds.createVariable('y', 'f8', ('y',))
+        # Set spatial coordinates from GPU arrays
         xs[:] = self.x.get()
         ys[:] = self.y.get()
+        # Create wavenumber coordinate in isotropic spectrum
         kk = self.ds.createVariable('k','f8',('k',))
         kk[:] = self.kk_iso.get()
         ## prognostic variable
-        self.q_var = self.ds.createVariable('q', 'f8', ('time', 'x', 'y'), zlib=False)
-        self.psi_var = self.ds.createVariable('psi', 'f8', ('time', 'x', 'y'), zlib=False)
-        self.rv_var = self.ds.createVariable('rv', 'f8', ('time', 'x', 'y'), zlib=False)
+        self.q_var = self.ds.createVariable('q', 'f8', ('time', 'y', 'x'), zlib=False)
+        self.psi_var = self.ds.createVariable('psi', 'f8', ('time', 'y', 'x'), zlib=False)
+        self.rv_var = self.ds.createVariable('rv', 'f8', ('time', 'y', 'x'), zlib=False)
         ## diagonistic variable
         ## invariant quantities
         self.Etot_var = self.ds.createVariable('Etot', 'f8', ('time',))
@@ -746,80 +836,102 @@ class QGModel:
         self.ds.cl = self.cl
 
     def save_rst(self,it):
+        """Save model state to restart file for integration continuation
+        
+        Stores vorticity and time derivatives required for RK4 or AB3 schemes
+        
+        Args:
+            it: Output record number index
+        """
+        # Transform vorticity and time derivatives to physical space
         q_r = ifft2(self.q_hat).real.get()
         k1_p_r = ifft2(self.k1_p).real.get()
         k1_pp_r = ifft2(self.k1_pp).real.get()
+        # Record simulation time
         self.rst_times[it] = self.t
+        # Store time history based on integration scheme
         if self.ts_scheme == 'ab3':
+            # AB3 requires 3 previous steps
             self.qrst_var[it,0,:,:] = k1_pp_r
             self.qrst_var[it,1,:,:] = k1_p_r
             self.qrst_var[it,2,:,:] = q_r
         elif self.ts_scheme == 'rk4':
+            # RK4 only requires current state
             self.qrst_var[it,0,:,:] = q_r
+        # Flush to disk
         self.rstds.sync()
         del q_r, k1_p_r, k1_pp_r
         gc.collect()
 
 
     def save_var(self,it):
+        """Save diagnostic variables to output file
+        
+        Computes and stores spectral energy/enstrophy and all budget terms
+        
+        Args:
+            it: Output record number index
+        """
+        # Transform prognostic fields to physical space
         p_r = ifft2(self.p_hat).real.get()
         q_r = ifft2(self.q_hat).real.get()
         rv_r = ifft2(self.rv_hat).real.get()
+        # Record simulation time
         self.times[it] = self.t
-        ## prognostic variable
+        # Store prognostic variables
         self.q_var[it,:,:] = q_r
         self.psi_var[it,:,:] = p_r
         self.rv_var[it,:,:] = rv_r
-        # diagnostic variable
-        # invariant quantities
+        # Store diagnostic variables
+        # Energy and enstrophy total quantities
         self.Etot_var[it] = self.get_Etot(self.p_hat)
         self.Ztot_var[it] = self.get_Ztot(self.q_hat)
         self.Ek_var[it,:] = self.get_Ek(self.p_hat) 
         self.Zk_var[it,:] = self.get_Zk(self.q_hat) 
-        # tendency budget
+        # Energy and enstrophy budget terms
+        # Non-linear advection transfer and flux
         self.tenlk_var[it,:],self.tznlk_var[it,:], self.fenlk_var[it,:], self.fznlk_var[it,:] = self.get_diagNL(self.p_hat,self.q_hat)
-        # forcing 
+        # Forcing transfer and flux
         self.tefk_var[it,:], self.tzfk_var[it,:], self.fefk_var[it,:], self.fzfk_var[it,:] = self.get_diagF(self.p_hat,self.q_hat,self.force_q)
-        # friction 
+        # Friction dissipation and flux
         self.tefrick_var[it,:], self.tzfrick_var[it,:],self.fefrick_var[it,:], self.fzfrick_var[it,:] = self.get_diagFric(self.p_hat,self.q_hat)
-        # viscosity
+        # Hyperviscosity dissipation and flux
         self.tevisck_var[it,:], self.tzvisck_var[it,:], self.fevisck_var[it,:], self.fzvisck_var[it,:] = self.get_diagVisc(self.p_hat,self.q_hat)
-        # filter
+        # Spectral filter loss and flux
         self.tefiltk_var[it,:], self.tzfiltk_var[it,:],self.fefiltk_var[it,:], self.fzfiltk_var[it,:] = self.get_diagFilt(self.p_hat,self.q_hat)
 
+        # Flush to disk
         self.ds.sync()
         del q_r, p_r, rv_r
         gc.collect()
         
-### plot term     
+    # Plotting and visualization methods
     def plot_diag(self, save_path=None):
+        """Plot energy spectrum and budget diagnostics
+        
+        Visualizes PV field, energy spectrum, energy tendency budget, and flux budget
+        
+        Args:
+            save_path: Optional path to save figure
         """
-        Plots the current state and Energy budgets (Tendency and Flux).
-        Layout:
-          - Top (4x4): PV Field
-          - Bottom Left: Energy Spectrum
-          - Bottom Center: Energy Tendency Budget
-          - Bottom Right: Energy Flux Budget
-        """
-        # --- 1. Compute Diagnostics ---
+        # Compute all diagnostic budget terms
         Ek = self.get_Ek(self.p_hat)
         
-        # A. Non-Linear Transfer & Flux
+        # Non-Linear advection transfer & flux
         tenl, _, fenl, _ = self.get_diagNL(self.p_hat, self.q_hat)
         
-        # B. Forcing (Injection) & Flux
+        # Forcing (injection) transfer & flux
         teF, _, feF, _ = self.get_diagF(self.p_hat, self.q_hat, self.force_q)
         
-        # C. Dissipation Terms (Calculated Separately)
+        # Dissipation terms (all dissipative processes)
         tevisc, _, fevisc, _ = self.get_diagVisc(self.p_hat, self.q_hat)
         tefric, _, fefric, _ = self.get_diagFric(self.p_hat, self.q_hat)
         tefilt, _, fefilt, _ = self.get_diagFilt(self.p_hat, self.q_hat)
         tecda,_,fecda,_ = self.get_diagCda(self.p_hat,self.q_hat,self.cda_term)
-        # --- 2. Normalize to Mean (Density) ---
-        # Current variables are "Total Sums". Divide by grid size to get "Mean per point".
+        # Normalize to mean per grid point
         norm_fac = 1.0 / (self.Nx * self.Ny)
         
-        # Scale Tendencies
+        # Scale energy tendencies
         tenl *= norm_fac
         teF *= norm_fac
         tevisc *= norm_fac
@@ -827,7 +939,7 @@ class QGModel:
         tefilt *= norm_fac
         tecda *= norm_fac
         
-        # Scale Fluxes
+        # Scale energy fluxes
         fenl *= norm_fac
         feF *= norm_fac
         fevisc *= norm_fac
@@ -835,28 +947,28 @@ class QGModel:
         fefilt *= norm_fac
         fecda *= norm_fac
         
-        # Scale Energy Spectrum
+        # Scale energy spectrum
         Ek = Ek * norm_fac
 
-        # D. Residuals (Should be ~0 in steady state)
-        # Tendency Residual: dE/dt = NL + Forcing + Viscosity + Friction
+        # Compute residual budget terms
+        # Tendency residual: should sum to zero in steady state
         te_sum = tenl + teF + tevisc + tefric + tefilt + tecda
         
-        # Flux Residual: Sum of cumulative fluxes
+        # Flux residual: cumulative sum of all fluxes
         fe_sum = fenl + feF + fevisc + fefric + fefilt + fecda
 
-        # --- 3. Setup Figure ---
+        # Create figure with subplots
         plt.rcParams.update({'font.size': 20})
         fig = plt.figure(figsize=(30, 18), tight_layout=True)
         gs = fig.add_gridspec(6, 6)
 
-        # Assign Axes
+        # Assign subplot positions
         ax_pv = fig.add_subplot(gs[0:4, 1:5])
         ax_spec = fig.add_subplot(gs[4:, 0:2])
-        ax_tendency = fig.add_subplot(gs[4:, 2:4]) # Center Bottom
-        ax_flux = fig.add_subplot(gs[4:, 4:])      # Right Bottom
+        ax_tendency = fig.add_subplot(gs[4:, 2:4]) 
+        ax_flux = fig.add_subplot(gs[4:, 4:])      
 
-        # --- 4. Plotting ---
+        # Plotting diagnostics
 
         # Panel 1: PV Field
         q_phys = ifft2(self.q_hat).real.get()
@@ -933,43 +1045,67 @@ class QGModel:
             plt.show()
 
     def save_snapshot(self,nstep):
-        """Called inside run loop to save the diagnostic figure."""
-        # Create directory
+        """Save diagnostic figure as PNG snapshot during simulation
+        
+        Creates figures directory and stores plot at specified timestep
+        
+        Args:
+            nstep: Integration step number for figure naming
+        """
+        # Create figures output directory
         outdir = os.path.join(self.savedir, "figs")
         os.makedirs(outdir, exist_ok=True)
         
-        # Save figure with time-stamp
+        # Save figure with timestep counter
         filename = os.path.join(outdir, f"snap_{nstep:04d}.png")
         self.plot_diag(save_path=filename)
 
-### run 
+    # Main simulation loop
     def run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,savedir='run_0',saveplot=False):
+        """Run main simulation loop with output checkpointing
+        
+        Integrates model forward in time with periodic diagnostics and restart saves
+        
+        Args:
+            scheme: Time stepping scheme ('ab3' or 'rk4')
+            tmax: Maximum simulation time
+            tsave: Steps between diagnostic output
+            nsave: Diagnostics saved per output file
+            savedir: Directory for output files
+            saveplot: Whether to save plotting snapshots
+        """
         self.ts_scheme = scheme
         self.tmax = tmax
         self.tsave = tsave
+        # Initialize or continue from restart time
         if self.trst:
             self.t = self.trst
         else:
             self.t = 0    
         self.savedir = savedir
         os.makedirs(self.savedir, exist_ok=True)
-        tsrst = int(1/self.dt) # save rst every 1  time unit timestep
+        # Save restart files every 1 time unit
+        tsrst = int(1/self.dt) 
         nrst = nsave
         insave=nsave
         inrst = nrst
         nf=0
         nfrst=0
 
-        for n in range(int(tmax/self.dt)):
+        # Main time integration loop
+        for n in range(int(tmax/self.dt)+1):
             self.n_steps = n
+            # Check if need to create new output file
             if insave == nsave:
-                itsave =0 #time index
+                itsave =0 
                 if nf > 0 : self.ds.close()
                 self.create_nc(nf)
-                insave=0 #save number index
+                insave=0 
                 nf+=1
+            # Save diagnostics at specified intervals
             if n%tsave == 0:
                 self.save_var(itsave)
+                # Compute and print energy and diagnostic statistics
                 E_crt = self.get_Etot(self.p_hat)/self.Nx/self.Ny
                 Vrms_crt = self.get_Vrms(self.p_hat)
                 Qrms_crt = self.get_Qrms(self.q_hat)
@@ -979,24 +1115,26 @@ class QGModel:
                 itsave +=1
                 insave +=1
 
+            # Check if need to create new restart file
             if self.n_steps % tsrst==0:
                 if inrst == nrst:
-                    itrst =0 #time index -it
+                    itrst =0 
                     if nfrst > 0 : self.rstds.close()
                     self.create_rst(nfrst)
-                    inrst=0 #save number index-in
+                    inrst=0 
                     nfrst+=1
 
                 self.save_rst(itrst)
                 itrst +=1
                 inrst +=1
+            # Advance model state by one timestep
             self._step_forward()
             self.t += self.dt
+        # Close output files at end of simulation
         self.ds.close()
         self.rstds.close()
         print('Done.')
     
-    # def cda_run(self,truth,...)
     def _my_div(self):
         my_div_color = np.array(  [
                  [0,0,123],

@@ -186,7 +186,7 @@ def plot_tebudget_avg(ds, tmin=None,tmax=None):
     tefilt = ds_t.tefiltk.mean(axis=0).values * norm_fac
     
     # Calculate Residual
-    
+    te_sum = tenl + teF + tevisc + tefric + tefilt
     
     # Wavenumbers
     ks = ds.k.values / (2 * np.pi / Lx)
@@ -274,7 +274,8 @@ def plot_febudget_avg(ds, tmin=None,tmax=None,versus=None):
     
     # Residual
     fe_sum = fenl + feF + fevisc + fefric + fefilt
-    fe_sum_ref = fenl_ref + feF_ref + fevisc_ref + fefric_ref + fefilt_ref
+    if versus:
+        fe_sum_ref = fenl_ref + feF_ref + fevisc_ref + fefric_ref + fefilt_ref
     ks = ds.k.values / (2 * np.pi / Lx)
 
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
@@ -291,7 +292,7 @@ def plot_febudget_avg(ds, tmin=None,tmax=None,versus=None):
         ax.semilogx(ks, fevisc_ref,'--', label='Visc. Flux REF', color='tab:orange', linewidth=2.5)
         ax.semilogx(ks, fefric_ref,'--', label='Fric. Flux REF', color='tab:red', linewidth=2.5)
         ax.semilogx(ks, fefilt_ref,'--', label='Filt. Flux REF', color='tab:purple', linewidth=2.5)
-        ax.semilogx(ks, fe_sum, 'k--', label='Sum (Residual) REF', linewidth=1.5)
+        ax.semilogx(ks, fe_sum_ref, 'k--', label='Sum (Residual) REF', linewidth=1.5)
 
     ax.axhline(0, color='k', linestyle='-', linewidth=1.5)
     ax.set_xlim([1, int(Nx/2)])
