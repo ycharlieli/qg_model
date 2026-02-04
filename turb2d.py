@@ -699,52 +699,58 @@ class QGModel:
         """
         outdir = self.savedir
         # Create restart filename with counter
-        if self.is_not_rst:
-            nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
+        nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
+            
+        if os.path.exists(nc_filename):
+            # Append to existing file
+            self.rstds = nc.Dataset(nc_filename, 'a', format='NETCDF4')
+            self.rst_times = self.rstds.variables['time']
+            self.qrst_var = self.rstds.variables['qrst']
         else:
-            nc_filename = os.path.join(outdir, "rst_r%04d.nc"%(nf))
-        self.rstds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
-        # Create dimensions for time, integration scheme index, and spatial grid
-        time_dim = self.rstds.createDimension('time', None) 
-        if self.ts_scheme  == 'rk4':
-            ind_dim = self.rstds.createDimension('ind', 1) 
-        elif self.ts_scheme ==  'ab3':
-            ind_dim = self.rstds.createDimension('ind', 3) 
-        x_dim = self.rstds.createDimension('x', self.Nx)
-        y_dim = self.rstds.createDimension('y', self.Ny)
-        # Create coordinate variables
-        self.rst_times = self.rstds.createVariable('time', 'f8', ('time',))
-        inds = self.rstds.createVariable('ind', 'f8', ('ind',))
-        xs = self.rstds.createVariable('x', 'f8', ('x',))
-        ys = self.rstds.createVariable('y', 'f8', ('y',))
-        # Initialize time step indices based on integration scheme
-        if self.ts_scheme  == 'rk4':
-            inds[:] = np.array([0,])
-        elif self.ts_scheme ==  'ab3':
-            inds[:] = np.array([0,1,2])
-        # Set spatial coordinates from GPU arrays
-        xs[:] = self.x.get()
-        ys[:] = self.y.get()
+            # Create new file
+            self.rstds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
+            # Create dimensions for time, integration scheme index, and spatial grid
+            time_dim = self.rstds.createDimension('time', None) 
+            if self.ts_scheme  == 'rk4':
+                ind_dim = self.rstds.createDimension('ind', 1) 
+            elif self.ts_scheme ==  'ab3':
+                ind_dim = self.rstds.createDimension('ind', 3) 
+            x_dim = self.rstds.createDimension('x', self.Nx)
+            y_dim = self.rstds.createDimension('y', self.Ny)
+            # Create coordinate variables
+            self.rst_times = self.rstds.createVariable('time', 'f8', ('time',))
+            inds = self.rstds.createVariable('ind', 'f8', ('ind',))
+            xs = self.rstds.createVariable('x', 'f8', ('x',))
+            ys = self.rstds.createVariable('y', 'f8', ('y',))
+            # Initialize time step indices based on integration scheme
+            if self.ts_scheme  == 'rk4':
+                inds[:] = np.array([0,])
+            elif self.ts_scheme ==  'ab3':
+                inds[:] = np.array([0,1,2])
+            # Set spatial coordinates from GPU arrays
+            xs[:] = self.x.get()
+            ys[:] = self.y.get()
 
-        # Create data variable for vorticity field
-        self.qrst_var = self.rstds.createVariable('qrst', 'f8', ('time','ind', 'y', 'x'), zlib=False)
+            # Create data variable for vorticity field
+            self.qrst_var = self.rstds.createVariable('qrst', 'f8', ('time','ind', 'y', 'x'), zlib=False)
 
-        # Store simulation parameters as global attributes
-        self.rstds.description = "QG Turbulence Simulation RST file"
-        self.rstds.dt = self.dt
-        self.rstds.Nx = self.Nx
-        self.rstds.Ny = self.Ny
-        self.rstds.Lx = self.Lx
-        self.rstds.Ly = self.Ly
-        self.rstds.ts_scheme = self.ts_scheme
-        self.rstds.kf = self.fscale
-        self.rstds.friction = self.friction
-        self.rstds.hyperorder=self.hyperorder
-        self.rstds.visc2 = self.visc2
-        self.rstds.hyvisc = self.hyvisc
-        self.rstds.gamma = self.gamma
-        self.rstds.beta = self.beta
-        self.rstds.cl = self.cl
+            # Store simulation parameters as global attributes
+            self.rstds.description = "QG Turbulence Simulation RST file"
+            self.rstds.dt = self.dt
+            self.rstds.Nx = self.Nx
+            self.rstds.Ny = self.Ny
+            self.rstds.Lx = self.Lx
+            self.rstds.Ly = self.Ly
+            self.rstds.ts_scheme = self.ts_scheme
+            self.rstds.kf = self.fscale
+            self.rstds.friction = self.friction
+            self.rstds.hyperorder=self.hyperorder
+            self.rstds.visc2 = self.visc2
+            self.rstds.hyvisc = self.hyvisc
+            self.rstds.gamma = self.gamma
+            self.rstds.beta = self.beta
+            self.rstds.cl = self.cl
+            # self.rst_time_offset = 0
 
     def create_nc(self,nf):
         """Create NetCDF file for output diagnostics
@@ -756,84 +762,116 @@ class QGModel:
         """
         outdir = self.savedir
         # Create output filename with counter
-        if self.is_not_rst:
-            nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
+        nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
+        
+        if os.path.exists(nc_filename):
+            # Append to existing file
+            self.ds = nc.Dataset(nc_filename, 'a', format='NETCDF4')
+            self.times = self.ds.variables['time']
+            self.q_var = self.ds.variables['q']
+            self.psi_var = self.ds.variables['psi']
+            self.rv_var = self.ds.variables['rv']
+            self.Etot_var = self.ds.variables['Etot']
+            self.Ztot_var = self.ds.variables['Ztot']
+            self.Ek_var = self.ds.variables['Ek']
+            self.Zk_var = self.ds.variables['Zk']
+            self.tenlk_var = self.ds.variables['tenlk']
+            self.tznlk_var = self.ds.variables['tznlk']
+            self.tefk_var = self.ds.variables['tefk']
+            self.tzfk_var = self.ds.variables['tzfk']
+            self.tefrick_var = self.ds.variables['tefrick']
+            self.tzfrick_var = self.ds.variables['tzfrick']
+            self.tevisck_var = self.ds.variables['tevisck']
+            self.tzvisck_var = self.ds.variables['tzvisck']
+            self.tefiltk_var = self.ds.variables['tefiltk']
+            self.tzfiltk_var = self.ds.variables['tzfiltk']
+            self.fenlk_var = self.ds.variables['fenlk']
+            self.fznlk_var = self.ds.variables['fznlk']
+            self.fefk_var = self.ds.variables['fefk']
+            self.fzfk_var = self.ds.variables['fzfk']
+            self.fefrick_var = self.ds.variables['fefrick']
+            self.fzfrick_var = self.ds.variables['fzfrick']
+            self.fevisck_var = self.ds.variables['fevisck']
+            self.fzvisck_var = self.ds.variables['fzvisck']
+            self.fefiltk_var = self.ds.variables['fefiltk']
+            self.fzfiltk_var = self.ds.variables['fzfiltk']
         else:
-            nc_filename = os.path.join(outdir, "output_r%04d.nc"%(nf))
-        self.ds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
-        # Create dimensions for time, spatial grid, and wavenumber spectrum
-        time_dim = self.ds.createDimension('time', None) 
-        x_dim = self.ds.createDimension('x', self.Nx)
-        y_dim = self.ds.createDimension('y', self.Ny)
-        k_dim = self.ds.createDimension('k',len(self.kk_iso))
-        # Create coordinate variables
-        self.times = self.ds.createVariable('time', 'f8', ('time',))
-        xs = self.ds.createVariable('x', 'f8', ('x',))
-        ys = self.ds.createVariable('y', 'f8', ('y',))
-        # Set spatial coordinates from GPU arrays
-        xs[:] = self.x.get()
-        ys[:] = self.y.get()
-        # Create wavenumber coordinate in isotropic spectrum
-        kk = self.ds.createVariable('k','f8',('k',))
-        kk[:] = self.kk_iso.get()
-        ## prognostic variable
-        self.q_var = self.ds.createVariable('q', 'f8', ('time', 'y', 'x'), zlib=False)
-        self.psi_var = self.ds.createVariable('psi', 'f8', ('time', 'y', 'x'), zlib=False)
-        self.rv_var = self.ds.createVariable('rv', 'f8', ('time', 'y', 'x'), zlib=False)
-        ## diagonistic variable
-        ## invariant quantities
-        self.Etot_var = self.ds.createVariable('Etot', 'f8', ('time',))
-        self.Ztot_var = self.ds.createVariable('Ztot', 'f8', ('time',))
-        self.Ek_var = self.ds.createVariable('Ek', 'f8', ('time', 'k'), zlib=False)
-        self.Zk_var = self.ds.createVariable('Zk', 'f8', ('time', 'k'), zlib=False)
-        ## tendency budget
-        # non-linear advection
-        self.tenlk_var = self.ds.createVariable('tenlk', 'f8', ('time', 'k'), zlib=False)
-        self.tznlk_var = self.ds.createVariable('tznlk', 'f8', ('time', 'k'), zlib=False)
-        # forcing 
-        self.tefk_var = self.ds.createVariable('tefk', 'f8', ('time', 'k'), zlib=False)
-        self.tzfk_var = self.ds.createVariable('tzfk', 'f8', ('time', 'k'), zlib=False)
-        # friction
-        self.tefrick_var = self.ds.createVariable('tefrick', 'f8', ('time', 'k'), zlib=False)
-        self.tzfrick_var = self.ds.createVariable('tzfrick', 'f8', ('time', 'k'), zlib=False)
-        # viscosity
-        self.tevisck_var = self.ds.createVariable('tevisck', 'f8', ('time', 'k'), zlib=False)
-        self.tzvisck_var = self.ds.createVariable('tzvisck', 'f8', ('time', 'k'), zlib=False)
-        # filter
-        self.tefiltk_var = self.ds.createVariable('tefiltk', 'f8', ('time', 'k'), zlib=False)
-        self.tzfiltk_var = self.ds.createVariable('tzfiltk', 'f8', ('time', 'k'), zlib=False)
-        ## flux budget
-        # non-linear advection
-        self.fenlk_var = self.ds.createVariable('fenlk', 'f8', ('time', 'k'), zlib=False)
-        self.fznlk_var = self.ds.createVariable('fznlk', 'f8', ('time', 'k'), zlib=False)
-        # forcing 
-        self.fefk_var = self.ds.createVariable('fefk', 'f8', ('time', 'k'), zlib=False)
-        self.fzfk_var = self.ds.createVariable('fzfk', 'f8', ('time', 'k'), zlib=False)
-        # friction
-        self.fefrick_var = self.ds.createVariable('fefrick', 'f8', ('time', 'k'), zlib=False)
-        self.fzfrick_var = self.ds.createVariable('fzfrick', 'f8', ('time', 'k'), zlib=False)
-        # viscosity
-        self.fevisck_var = self.ds.createVariable('fevisck', 'f8', ('time', 'k'), zlib=False)
-        self.fzvisck_var = self.ds.createVariable('fzvisck', 'f8', ('time', 'k'), zlib=False)
-        # filter
-        self.fefiltk_var = self.ds.createVariable('fefiltk', 'f8', ('time', 'k'), zlib=False)
-        self.fzfiltk_var = self.ds.createVariable('fzfiltk', 'f8', ('time', 'k'), zlib=False)
+            # Create new file
+            self.ds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
+            # Create dimensions for time, spatial grid, and wavenumber spectrum
+            time_dim = self.ds.createDimension('time', None) 
+            x_dim = self.ds.createDimension('x', self.Nx)
+            y_dim = self.ds.createDimension('y', self.Ny)
+            k_dim = self.ds.createDimension('k',len(self.kk_iso))
+            # Create coordinate variables
+            self.times = self.ds.createVariable('time', 'f8', ('time',))
+            xs = self.ds.createVariable('x', 'f8', ('x',))
+            ys = self.ds.createVariable('y', 'f8', ('y',))
+            # Set spatial coordinates from GPU arrays
+            xs[:] = self.x.get()
+            ys[:] = self.y.get()
+            # Create wavenumber coordinate in isotropic spectrum
+            kk = self.ds.createVariable('k','f8',('k',))
+            kk[:] = self.kk_iso.get()
+            ## prognostic variable
+            self.q_var = self.ds.createVariable('q', 'f8', ('time', 'y', 'x'), zlib=False)
+            self.psi_var = self.ds.createVariable('psi', 'f8', ('time', 'y', 'x'), zlib=False)
+            self.rv_var = self.ds.createVariable('rv', 'f8', ('time', 'y', 'x'), zlib=False)
+            ## diagonistic variable
+            ## invariant quantities
+            self.Etot_var = self.ds.createVariable('Etot', 'f8', ('time',))
+            self.Ztot_var = self.ds.createVariable('Ztot', 'f8', ('time',))
+            self.Ek_var = self.ds.createVariable('Ek', 'f8', ('time', 'k'), zlib=False)
+            self.Zk_var = self.ds.createVariable('Zk', 'f8', ('time', 'k'), zlib=False)
+            ## tendency budget
+            # non-linear advection
+            self.tenlk_var = self.ds.createVariable('tenlk', 'f8', ('time', 'k'), zlib=False)
+            self.tznlk_var = self.ds.createVariable('tznlk', 'f8', ('time', 'k'), zlib=False)
+            # forcing 
+            self.tefk_var = self.ds.createVariable('tefk', 'f8', ('time', 'k'), zlib=False)
+            self.tzfk_var = self.ds.createVariable('tzfk', 'f8', ('time', 'k'), zlib=False)
+            # friction
+            self.tefrick_var = self.ds.createVariable('tefrick', 'f8', ('time', 'k'), zlib=False)
+            self.tzfrick_var = self.ds.createVariable('tzfrick', 'f8', ('time', 'k'), zlib=False)
+            # viscosity
+            self.tevisck_var = self.ds.createVariable('tevisck', 'f8', ('time', 'k'), zlib=False)
+            self.tzvisck_var = self.ds.createVariable('tzvisck', 'f8', ('time', 'k'), zlib=False)
+            # filter
+            self.tefiltk_var = self.ds.createVariable('tefiltk', 'f8', ('time', 'k'), zlib=False)
+            self.tzfiltk_var = self.ds.createVariable('tzfiltk', 'f8', ('time', 'k'), zlib=False)
+            ## flux budget
+            # non-linear advection
+            self.fenlk_var = self.ds.createVariable('fenlk', 'f8', ('time', 'k'), zlib=False)
+            self.fznlk_var = self.ds.createVariable('fznlk', 'f8', ('time', 'k'), zlib=False)
+            # forcing 
+            self.fefk_var = self.ds.createVariable('fefk', 'f8', ('time', 'k'), zlib=False)
+            self.fzfk_var = self.ds.createVariable('fzfk', 'f8', ('time', 'k'), zlib=False)
+            # friction
+            self.fefrick_var = self.ds.createVariable('fefrick', 'f8', ('time', 'k'), zlib=False)
+            self.fzfrick_var = self.ds.createVariable('fzfrick', 'f8', ('time', 'k'), zlib=False)
+            # viscosity
+            self.fevisck_var = self.ds.createVariable('fevisck', 'f8', ('time', 'k'), zlib=False)
+            self.fzvisck_var = self.ds.createVariable('fzvisck', 'f8', ('time', 'k'), zlib=False)
+            # filter
+            self.fefiltk_var = self.ds.createVariable('fefiltk', 'f8', ('time', 'k'), zlib=False)
+            self.fzfiltk_var = self.ds.createVariable('fzfiltk', 'f8', ('time', 'k'), zlib=False)
 
-        self.ds.description = "QG Turbulence Simulation"
-        self.ds.dt = self.dt
-        self.ds.Nx = self.Nx
-        self.ds.Ny = self.Ny
-        self.ds.Lx = self.Lx
-        self.ds.Ly = self.Ly
-        self.ds.ts_scheme = self.ts_scheme
-        self.ds.kf = self.fscale
-        self.ds.hyperorder=self.hyperorder
-        self.ds.friction = self.friction
-        self.ds.visc2 = self.visc2
-        self.ds.hyvisc = self.hyvisc
-        self.ds.gamma = self.gamma
-        self.ds.beta = self.beta
-        self.ds.cl = self.cl
+            self.ds.description = "QG Turbulence Simulation"
+            self.ds.dt = self.dt
+            self.ds.Nx = self.Nx
+            self.ds.Ny = self.Ny
+            self.ds.Lx = self.Lx
+            self.ds.Ly = self.Ly
+            self.ds.ts_scheme = self.ts_scheme
+            self.ds.kf = self.fscale
+            self.ds.hyperorder=self.hyperorder
+            self.ds.friction = self.friction
+            self.ds.visc2 = self.visc2
+            self.ds.hyvisc = self.hyvisc
+            self.ds.gamma = self.gamma
+            self.ds.beta = self.beta
+            self.ds.cl = self.cl
+            # self.nc_time_offset = 0
 
     def save_rst(self,it):
         """Save model state to restart file for integration continuation
@@ -1077,31 +1115,65 @@ class QGModel:
         self.ts_scheme = scheme
         self.tmax = tmax
         self.tsave = tsave
-        # Initialize or continue from restart time
-        if self.trst:
-            self.t = self.trst
-        else:
-            self.t = 0    
         self.savedir = savedir
         os.makedirs(self.savedir, exist_ok=True)
         # Save restart files every 1 time unit
         tsrst = int(1/self.dt) 
         nrst = nsave
-        insave=nsave
-        inrst = nrst
-        nf=0
-        nfrst=0
+
+        # Initialize or continue from restart time
+        if self.trst:
+            self.t = self.trst
+            # Calculate which file and position to resume from
+            hist_saves = int(self.trst / self.dt / tsave)
+            nf = hist_saves // nsave
+            itsave = hist_saves % nsave
+            
+            # Setup initial file state for restart
+            if itsave == 0:
+                insave = nsave  # Force create_nc next step
+            else:
+                insave = itsave
+                # Open existing file for appending since we're mid-file
+                self.create_nc(nf)
+                nf += 1
+            
+            hist_saves_rst = int(self.trst / self.dt / tsrst)
+            nfrst = hist_saves_rst // nrst
+            itrst = hist_saves_rst % nrst
+            
+            # Setup initial restart file state 
+            if itrst == 0:
+                inrst = nrst # Force create_rst next step
+            else:
+                inrst = itrst
+                # Open existing file for appending since we're mid-file
+                self.create_rst(nfrst)
+                nfrst += 1
+                
+            n_start = int(self.trst / self.dt)
+        else:
+            self.t = 0
+            nf = 0
+            nfrst = 0
+            itsave = 0
+            itrst = 0
+            insave = nsave
+            inrst = nrst
+            n_start = 0
 
         # Main time integration loop
-        for n in range(int(tmax/self.dt)+1):
+        for n in range(n_start, int(tmax/self.dt)+1):
             self.n_steps = n
             # Check if need to create new output file
             if insave == nsave:
-                itsave =0 
-                if nf > 0 : self.ds.close()
+                itsave = 0
+                if nf > 0 or (nf == 0 and self.trst > 0):
+                    if hasattr(self, 'ds'):
+                        self.ds.close()
                 self.create_nc(nf)
-                insave=0 
-                nf+=1
+                insave = 0
+                nf += 1
             # Save diagnostics at specified intervals
             if n%tsave == 0:
                 self.save_var(itsave)
@@ -1118,15 +1190,17 @@ class QGModel:
             # Check if need to create new restart file
             if self.n_steps % tsrst==0:
                 if inrst == nrst:
-                    itrst =0 
-                    if nfrst > 0 : self.rstds.close()
+                    itrst = 0
+                    if nfrst > 0 or (nfrst == 0 and self.trst > 0):
+                        if hasattr(self, 'rstds'):
+                            self.rstds.close()
                     self.create_rst(nfrst)
-                    inrst=0 
-                    nfrst+=1
+                    inrst = 0
+                    nfrst += 1
 
                 self.save_rst(itrst)
-                itrst +=1
-                inrst +=1
+                itrst += 1
+                inrst += 1
             # Advance model state by one timestep
             self._step_forward()
             self.t += self.dt
