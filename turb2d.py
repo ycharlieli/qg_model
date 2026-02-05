@@ -2,7 +2,6 @@
 import numpy as np
 import cupy as cp
 import cupyx.scipy.fft as cufft
-import scipy as sp
 from scipy.fft import fft2,rfft2,ifft2,fftshift,irfft2
 import numpy_groupies as npg
 import matplotlib.pyplot as plt
@@ -61,10 +60,10 @@ class QGModel:
         self.fscale = fscale # scale of wind
         self.finput = finput # enstrophy injection rate of wind
         self.famp = famp
-        self.force_q = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
-        self.cda_term = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
-        self.k1_p = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
-        self.k1_pp = cp.zeros((self.Nx, self.Ny), dtype=np.complex128)
+        self.force_q = cp.zeros((self.Ny, self.Nx), dtype=np.complex128)
+        self.da_term = cp.zeros((self.Ny, self.Nx), dtype=np.complex128)
+        self.k1_p = cp.zeros((self.Ny, self.Nx), dtype=np.complex128)
+        self.k1_pp = cp.zeros((self.Ny, self.Nx), dtype=np.complex128)
         self.is_not_rst = True
         self._prebuild_operator()
         self._my_div()
@@ -193,7 +192,7 @@ class QGModel:
         damping_term = (-self.friction_mask*self.friction + self.hylap)*rv_hat
         damping_term+=self._compute_leith_term(rv_hat)
         
-        return -jacobian_term-beta_term+damping_term+self.force_q+self.cda_term
+        return -jacobian_term-beta_term+damping_term+self.force_q+self.da_term
 
     def _rk4(self, q_hat):
         """Compute 4th order Runge-Kutta stages"""
@@ -597,28 +596,28 @@ class QGModel:
 
         return teF_kk, tzF_kk, feF_kk, fzF_kk
 
-    def get_diagCda(self,p_hat,q_hat,cda_term):
+    def get_diagDa(self,p_hat,q_hat,da_term):
         """Compute energy and enstrophy budgets from data assimilation nudging
         
         Returns spectral transfer and flux for both quantities
         """
-        # spectral energy transfer of CDA
-        tecda = -cp.real(cp.conj(p_hat)*cda_term)
-        # spectral enstrophy transfer of CDA
-        tzcda = cp.real(cp.conj(q_hat)*cda_term)
+        # spectral energy transfer of DA
+        teda = -cp.real(cp.conj(p_hat)*da_term)
+        # spectral enstrophy transfer of DA
+        tzda = cp.real(cp.conj(q_hat)*da_term)
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer 
         # In physical space using spectral aggregation
-        tecda_kk = npg.aggregate(self.kk_idx.ravel().get(),tecda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        teda_kk = npg.aggregate(self.kk_idx.ravel().get(),teda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of enstrophy transfer 
         # In physical space 
-        tzcda_kk =npg.aggregate(self.kk_idx.ravel().get(),tzcda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        tzda_kk =npg.aggregate(self.kk_idx.ravel().get(),tzda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of energy flux
-        fecda_kk = np.cumsum(tecda_kk[::-1])[::-1]
+        feda_kk = np.cumsum(teda_kk[::-1])[::-1]
         # Isotropic spectrum of enstrophy flux
-        fzcda_kk = np.cumsum(tzcda_kk[::-1])[::-1]
+        fzda_kk = np.cumsum(tzda_kk[::-1])[::-1]
 
-        return tecda_kk, tzcda_kk, fecda_kk, fzcda_kk
+        return teda_kk, tzda_kk, feda_kk, fzda_kk
 
     def get_diagFric(self,p_hat,q_hat):
         """Compute energy and enstrophy dissipation from large-scale friction
@@ -752,17 +751,18 @@ class QGModel:
             self.rstds.cl = self.cl
             # self.rst_time_offset = 0
 
-    def create_nc(self,nf):
+    def create_nc(self,nf,prefix='output'):
         """Create NetCDF file for output diagnostics
         
         Initializes file with dimensions and coordinate variables for diagnostics output
         
         Args:
             nf: File counter for output numbering
+            prefix: Filename prefix
         """
         outdir = self.savedir
         # Create output filename with counter
-        nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
+        nc_filename = os.path.join(outdir, "%s_%04d.nc"%(prefix,nf))
         
         if os.path.exists(nc_filename):
             # Append to existing file
@@ -795,6 +795,12 @@ class QGModel:
             self.fzvisck_var = self.ds.variables['fzvisck']
             self.fefiltk_var = self.ds.variables['fefiltk']
             self.fzfiltk_var = self.ds.variables['fzfiltk']
+            
+            self.daF_var = self.ds.variables['daF']
+            self.tedak_var = self.ds.variables['tedak']
+            self.tzdak_var = self.ds.variables['tzdak']
+            self.fedak_var = self.ds.variables['fedak']
+            self.fzdak_var = self.ds.variables['fzdak']
         else:
             # Create new file
             self.ds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
@@ -855,6 +861,12 @@ class QGModel:
             # filter
             self.fefiltk_var = self.ds.createVariable('fefiltk', 'f8', ('time', 'k'), zlib=False)
             self.fzfiltk_var = self.ds.createVariable('fzfiltk', 'f8', ('time', 'k'), zlib=False)
+
+            self.daF_var = self.ds.createVariable('daF', 'f8', ('time', 'y', 'x'), zlib=False)
+            self.tedak_var = self.ds.createVariable('tedak', 'f8', ('time', 'k'), zlib=False)
+            self.tzdak_var = self.ds.createVariable('tzdak', 'f8', ('time', 'k'), zlib=False)
+            self.fedak_var = self.ds.createVariable('fedak', 'f8', ('time', 'k'), zlib=False)
+            self.fzdak_var = self.ds.createVariable('fzdak', 'f8', ('time', 'k'), zlib=False)
 
             self.ds.description = "QG Turbulence Simulation"
             self.ds.dt = self.dt
@@ -938,6 +950,11 @@ class QGModel:
         # Spectral filter loss and flux
         self.tefiltk_var[it,:], self.tzfiltk_var[it,:],self.fefiltk_var[it,:], self.fzfiltk_var[it,:] = self.get_diagFilt(self.p_hat,self.q_hat)
 
+        # Save DA term
+        self.daF_var[it, :, :] = ifft2(self.da_term).real.get()
+        # Save DA diagnostics
+        self.tedak_var[it,:], self.tzdak_var[it,:], self.fedak_var[it,:], self.fzdak_var[it,:] = self.get_diagDa(self.p_hat, self.q_hat, self.da_term)
+
         # Flush to disk
         self.ds.sync()
         del q_r, p_r, rv_r
@@ -965,7 +982,11 @@ class QGModel:
         tevisc, _, fevisc, _ = self.get_diagVisc(self.p_hat, self.q_hat)
         tefric, _, fefric, _ = self.get_diagFric(self.p_hat, self.q_hat)
         tefilt, _, fefilt, _ = self.get_diagFilt(self.p_hat, self.q_hat)
-        tecda,_,fecda,_ = self.get_diagCda(self.p_hat,self.q_hat,self.cda_term)
+        
+        teda = cp.zeros_like(tenl)
+        feda = cp.zeros_like(fenl)
+        teda,_,feda,_ = self.get_diagDa(self.p_hat,self.q_hat,self.da_term)
+        
         # Normalize to mean per grid point
         norm_fac = 1.0 / (self.Nx * self.Ny)
         
@@ -975,7 +996,7 @@ class QGModel:
         tevisc *= norm_fac
         tefric *= norm_fac
         tefilt *= norm_fac
-        tecda *= norm_fac
+        teda *= norm_fac
         
         # Scale energy fluxes
         fenl *= norm_fac
@@ -983,17 +1004,17 @@ class QGModel:
         fevisc *= norm_fac
         fefric *= norm_fac
         fefilt *= norm_fac
-        fecda *= norm_fac
+        feda *= norm_fac
         
         # Scale energy spectrum
         Ek = Ek * norm_fac
 
         # Compute residual budget terms
         # Tendency residual: should sum to zero in steady state
-        te_sum = tenl + teF + tevisc + tefric + tefilt + tecda
+        te_sum = tenl + teF + tevisc + tefric + tefilt + teda
         
         # Flux residual: cumulative sum of all fluxes
-        fe_sum = fenl + feF + fevisc + fefric + fefilt + fecda
+        fe_sum = fenl + feF + fevisc + fefric + fefilt + feda
 
         # Create figure with subplots
         plt.rcParams.update({'font.size': 20})
@@ -1046,7 +1067,7 @@ class QGModel:
         ax_tendency.semilogx(ks, tevisc, label='Viscosity', color='tab:orange', linewidth=2.5)
         ax_tendency.semilogx(ks, tefric, label='Friction', color='tab:brown', linewidth=2.5)
         ax_tendency.semilogx(ks, tefilt, label='Filter', color='tab:purple', linewidth=2.5)
-        ax_tendency.semilogx(ks, tecda, label='CDA', color='tab:red', linewidth=2.5)
+        ax_tendency.semilogx(ks, teda, label='DA', color='tab:red', linewidth=2.5)
         ax_tendency.semilogx(ks, te_sum, 'k--', label='Sum (Residual)', linewidth=1.5)
         
         ax_tendency.axhline(0, color='k', linestyle='-', linewidth=1.5)
@@ -1064,7 +1085,7 @@ class QGModel:
         ax_flux.semilogx(ks, fevisc, label='Visc. Flux', color='tab:orange', linewidth=2.5)
         ax_flux.semilogx(ks, fefric, label='Fric. Flux', color='tab:brown', linewidth=2.5)
         ax_flux.semilogx(ks, fefilt, label='Filt. Flux', color='tab:purple', linewidth=2.5)
-        ax_flux.semilogx(ks, fecda, label='Cda. Flux', color='tab:red', linewidth=2.5)
+        ax_flux.semilogx(ks, feda, label='DA Flux', color='tab:red', linewidth=2.5)
         ax_flux.semilogx(ks, fe_sum, 'k--', label='Sum (Residual)', linewidth=1.5)
 
         ax_flux.axhline(0, color='k', linestyle='-', linewidth=1.5)
@@ -1204,7 +1225,7 @@ class QGModel:
                 inrst += 1
             # Advance model state by one timestep
             self._step_forward()
-            self.t += self.dt
+            self.t = self.trst + self.n_steps * self.dt
         # Close output files at end of simulation
         self.ds.close()
         self.rstds.close()

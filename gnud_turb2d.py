@@ -143,17 +143,7 @@ class QGGNUD:
         # Create output filename with counter
         nc_filename = os.path.join(outdir, "output_%04d.nc"%(nf))
 
-        if self.m.is_not_rst:
-            self.m.create_nc(nf)
-            self.gnudF_var = self.m.ds.createVariable('gnudF', 'f8', ('time', 'y', 'x'), zlib=False)
-            self.ihm_var = self.m.ds.createVariable('Ihm', 'f8', ('time', 'y', 'x'), zlib=False)
-            self.ihref_var = self.m.ds.createVariable('Ihref', 'f8', ('time', 'y', 'x'), zlib=False)
-            self.qrmse_var = self.m.ds.createVariable('qrmse', 'f8', ('time',), zlib=False)
-            self.tecdak_var = self.m.ds.createVariable('tecdak', 'f8', ('time', 'k'), zlib=False)
-            self.tzcdak_var = self.m.ds.createVariable('tzcdak', 'f8', ('time', 'k'), zlib=False)
-            self.fecdak_var = self.m.ds.createVariable('fecdak', 'f8', ('time', 'k'), zlib=False)
-            self.fzcdak_var = self.m.ds.createVariable('fzcdak', 'f8', ('time', 'k'), zlib=False)
-        else:
+        if os.path.exists(nc_filename):
             self.m.create_nc(nf)
             self.gnudF_var = self.m.ds.variables['gnudF']
             self.ihm_var = self.m.ds.variables['Ihm']
@@ -163,6 +153,16 @@ class QGGNUD:
             self.tzcdak_var = self.m.ds.variables['tzcdak']
             self.fecdak_var = self.m.ds.variables['fecdak']
             self.fzcdak_var = self.m.ds.variables['fzcdak']
+        else:
+            self.m.create_nc(nf)
+            self.gnudF_var = self.m.ds.createVariable('gnudF', 'f8', ('time', 'y', 'x'), zlib=False)
+            self.ihm_var = self.m.ds.createVariable('Ihm', 'f8', ('time', 'y', 'x'), zlib=False)
+            self.ihref_var = self.m.ds.createVariable('Ihref', 'f8', ('time', 'y', 'x'), zlib=False)
+            self.qrmse_var = self.m.ds.createVariable('qrmse', 'f8', ('time',), zlib=False)
+            self.tecdak_var = self.m.ds.createVariable('tecdak', 'f8', ('time', 'k'), zlib=False)
+            self.tzcdak_var = self.m.ds.createVariable('tzcdak', 'f8', ('time', 'k'), zlib=False)
+            self.fecdak_var = self.m.ds.createVariable('fecdak', 'f8', ('time', 'k'), zlib=False)
+            self.fzcdak_var = self.m.ds.createVariable('fzcdak', 'f8', ('time', 'k'), zlib=False)
 
     def save_var(self, it):
         """Save variables to netCDF output"""
