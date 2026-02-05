@@ -1122,45 +1122,48 @@ class QGModel:
         nrst = nsave
 
         # Initialize or continue from restart time
-        if self.trst:
+        if self.is_not_rst:
+            self.t = 0
+            nf0 = 0
+            nfrst0 = 0
+            itsave = 0
+            itrst = 0
+            insave = nsave
+            inrst = nrst
+            n_start = 0
+            nf = nf0
+            nfrst = nfrst0            
+        else:
             self.t = self.trst
             # Calculate which file and position to resume from
-            hist_saves = int(self.trst / self.dt / tsave)
-            nf = hist_saves // nsave
+            n_start_idx = int(round(self.trst / self.dt))
+            hist_saves = n_start_idx // tsave
+            nf0 = hist_saves // nsave
             itsave = hist_saves % nsave
-            
+            hist_saves_rst = n_start_idx // tsrst
+            nfrst0 = hist_saves_rst // nrst
+            itrst = hist_saves_rst % nrst
+            nf = nf0
+            nfrst = nfrst0
             # Setup initial file state for restart
             if itsave == 0:
                 insave = nsave  # Force create_nc next step
             else:
                 insave = itsave
                 # Open existing file for appending since we're mid-file
-                self.create_nc(nf)
-                nf += 1
-            
-            hist_saves_rst = int(self.trst / self.dt / tsrst)
-            nfrst = hist_saves_rst // nrst
-            itrst = hist_saves_rst % nrst
-            
+                self.create_nc(nf0)
+                
             # Setup initial restart file state 
             if itrst == 0:
                 inrst = nrst # Force create_rst next step
             else:
                 inrst = itrst
                 # Open existing file for appending since we're mid-file
-                self.create_rst(nfrst)
-                nfrst += 1
+                self.create_rst(nfrst0)
                 
-            n_start = int(self.trst / self.dt)
-        else:
-            self.t = 0
-            nf = 0
-            nfrst = 0
-            itsave = 0
-            itrst = 0
-            insave = nsave
-            inrst = nrst
-            n_start = 0
+                
+            n_start = n_start_idx
+        
 
         # Main time integration loop
         for n in range(n_start, int(tmax/self.dt)+1):
@@ -1168,9 +1171,8 @@ class QGModel:
             # Check if need to create new output file
             if insave == nsave:
                 itsave = 0
-                if nf > 0 or (nf == 0 and self.trst > 0):
-                    if hasattr(self, 'ds'):
-                        self.ds.close()
+                if nf > nf0:
+                    self.ds.close()
                 self.create_nc(nf)
                 insave = 0
                 nf += 1
@@ -1191,9 +1193,8 @@ class QGModel:
             if self.n_steps % tsrst==0:
                 if inrst == nrst:
                     itrst = 0
-                    if nfrst > 0 or (nfrst == 0 and self.trst > 0):
-                        if hasattr(self, 'rstds'):
-                            self.rstds.close()
+                    if nfrst > nfrst0:
+                        self.rstds.close()
                     self.create_rst(nfrst)
                     inrst = 0
                     nfrst += 1
