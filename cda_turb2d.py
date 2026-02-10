@@ -280,8 +280,7 @@ class QGCDA:
                         E_gnud = self.m_gnud.get_Etot(self.m_gnud.p_hat)/self.m_gnud.Nx/self.m_gnud.Ny
                     E_ref = self.m_ref.get_Etot(self.m_ref.p_hat)/self.m_ref.Nx/self.m_ref.Ny
 
-                    Vrms_crt = self.m.get_Vrms(self.m.p_hat)
-                    print(f"   step {self.m.n_steps:7d}  t={self.m.t:9.6f}s E_dns={E_dns:.4e} E_cda={E_cda:.4e} E_gnud={E_gnud:.4e} E_ref={E_ref:.4e} Vrms={Vrms_crt:.4e}", end="\n")
+                    print(f"   step {self.m.n_steps:7d}  t={self.m.t:9.6f}s E_dns={E_dns:.4e} E_cda={E_cda:.4e} E_gnud={E_gnud:.4e} E_ref={E_ref:.4e}", end="\n")
                     if saveplot:
                         self.m.plot_diag()
                     itsave +=1
