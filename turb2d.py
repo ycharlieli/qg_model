@@ -17,7 +17,7 @@ class QGModel:
     """2D Quasi-Geostrophic turbulence model with spectral methods"""
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
                  beta=0, gamma=0, 
-                 friction=0.01,k_friction = 20000,visc2 = 0,hyperorder=1,sp_filtr=False,cl=0,
+                 friction=0.01,k_friction = 20000,hyvisc = 0,hyperorder=1,sp_filtr=False,cl=0,
                  forcing=None,fscale=4,finput=3,famp=1.):
         """Initialize QG model with grid and parameters
         
@@ -29,7 +29,6 @@ class QGModel:
             gamma: Stratification parameter
             friction: Friction coefficient
             k_friction: Wavenumber cutoff for friction
-            visc2: Eddy viscosity coefficient
             hyperorder: Order of hyperviscosity (1=Laplacian, 2=Biharmonic, etc.)
             sp_filtr: Whether to apply spectral filter
             cl: Leith parameter for biharmonic viscosity
@@ -49,11 +48,10 @@ class QGModel:
         self.gamma = gamma # stratification parameter
         self.friction = friction # large scale friction
         self.k_friction = k_friction # wavenumber cutoff for friction
-        self.visc2 = visc2 # eddy viscosity
-        if hyperorder == 1:
-            self.hyvisc = self.visc2
-        else:
-            self.hyvisc = cp.float32(10*1/(self.Nx/2*(2*cp.pi/self.Lx))**(hyperorder*2)) # viscosity t_eddy/kmax**(2n)
+        # if hyperorder == 1:
+        self.hyvisc = hyvisc
+        # else:
+        #     self.hyvisc = cp.float32(10**np.log2(2*hyperorder)/(self.Nx/2*(2*np.pi/self.Lx))**(2*hyperorder)) # viscosity t_eddy/kmax**(2n)
         self.hyperorder = hyperorder # order of hyper viscosity, 1-> Newnation 2-> biharmonic ...
         self.sp_filtr = sp_filtr # spectral filter impose on the tail of spectral (Arbic 2003)
         self.cl = cl #leith parameter
@@ -393,16 +391,16 @@ class QGModel:
 
             if q_ini.ndim == 2:
 
-                self.q_hat = fft2(cp.array(q_ini.copy()))
+                self.q_hat = fft2(cp.array(q_ini.copy(),dtype=cp.float32))
                 self.p_hat = self.inversion*self.q_hat
                 self.rv_hat= self.lap*self.p_hat
             elif q_ini.ndim == 3 :
                 self.is_not_rst = False
-                self.q_hat = fft2(cp.array(q_ini[2,:,:].squeeze()))
+                self.q_hat = fft2(cp.array(q_ini[2,:,:].squeeze(),dtype=cp.float32))
                 self.p_hat = self.inversion*self.q_hat
                 self.rv_hat= self.lap*self.p_hat
-                self.k1_p = fft2(cp.array(q_ini[1,:,:].squeeze()))
-                self.k1_pp  = fft2(cp.array(q_ini[0,:,:].squeeze()))
+                self.k1_p = fft2(cp.array(q_ini[1,:,:].squeeze(),dtype=cp.float32))
+                self.k1_pp  = fft2(cp.array(q_ini[0,:,:].squeeze(), dtype=cp.float32))
             if eini:
                 self._norm_energy()
 
@@ -755,7 +753,6 @@ class QGModel:
             self.rstds.kf = self.fscale
             self.rstds.friction = self.friction
             self.rstds.hyperorder=self.hyperorder
-            self.rstds.visc2 = self.visc2
             self.rstds.hyvisc = self.hyvisc
             self.rstds.gamma = self.gamma
             self.rstds.beta = self.beta
@@ -889,7 +886,6 @@ class QGModel:
             self.ds.kf = self.fscale
             self.ds.hyperorder=self.hyperorder
             self.ds.friction = self.friction
-            self.ds.visc2 = self.visc2
             self.ds.hyvisc = self.hyvisc
             self.ds.gamma = self.gamma
             self.ds.beta = self.beta
@@ -1184,7 +1180,7 @@ class QGModel:
                 insave = itsave
                 # Open existing file for appending since we're mid-file
                 self.create_nc(nf0)
-                
+                nf+=1
             # Setup initial restart file state 
             if itrst == 0:
                 inrst = nrst # Force create_rst next step
@@ -1192,7 +1188,7 @@ class QGModel:
                 inrst = itrst
                 # Open existing file for appending since we're mid-file
                 self.create_rst(nfrst0)
-                
+                nfrst+=1
                 
             n_start = n_start_idx
         
@@ -1215,6 +1211,8 @@ class QGModel:
                 E_crt = self.get_Etot(self.p_hat)/self.Nx/self.Ny
                 Vrms_crt = self.get_Vrms(self.p_hat)
                 Qrms_crt = self.get_Qrms(self.q_hat)
+                import time
+                print(f"[save_var] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
                 print(f"   step {self.n_steps:7d}  t={self.t:9.6f}s E={E_crt:.4e} Vrms={Vrms_crt:.4e} Qrms={Qrms_crt:.4e}", end="\n")
                 if saveplot:
                     self.plot_diag()
@@ -1236,7 +1234,7 @@ class QGModel:
                 inrst += 1
             # Advance model state by one timestep
             self._step_forward()
-            self.t = self.trst + (self.n_steps+1) * self.dt
+            self.t = (self.n_steps+1) * self.dt
         # Close output files at end of simulation
         self.ds.close()
         self.rstds.close()

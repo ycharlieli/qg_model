@@ -97,9 +97,9 @@ class QGModel:
         self.kk = cp.sqrt(self.kx2d**2+self.ky2d**2)
 
         # 2/3 dealiasing mask: keep only modes up to user Nyquist
-        k_max_org = self.Nx_org / 2.0
-        self.dealias_mask = cp.zeros_like(self.kk)
-        self.dealias_mask[self.kk < k_max_org] = 1.0
+        # k_max_org = self.Nx_org / 2.0
+        # self.dealias_mask = cp.zeros_like(self.kk)
+        # self.dealias_mask[self.kk < k_max_org] = 1.0
 
         # self.kk_intvl = cp.round(self.kk).astype('int')
         # self.kk_set = cp.unique(self.kk_intvl) # isotropic wavenumber magnitude
@@ -132,7 +132,7 @@ class QGModel:
 
         # 3. Define Cutoff and Stiffness
         # Arbic uses 0.65 * Nyquist
-        cphi = 0.65 * cp.pi 
+        cphi = 0.67 * cp.pi 
         
         # Alpha (Stiffness). Arbic often uses 18.4 or 23.6.
         # You can make this a class parameter if you want.
@@ -253,7 +253,7 @@ class QGModel:
                 self.k1_pp = self.k1_p
                 self.k1_p = k1.copy()
 
-        self.q_hat *= self.dealias_mask
+        # self.q_hat *= self.dealias_mask
         self.q_hat *= self.filtr # apply spectral filter
         self.p_hat = self.inversion*self.q_hat
         self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
@@ -275,7 +275,7 @@ class QGModel:
     
         jacob_r = dyq_r*dxp_r-dyp_r*dxq_r
     
-        jacob_hat = fft2(jacob_r) * self.dealias_mask
+        jacob_hat = fft2(jacob_r) #* self.dealias_mask
     
         return jacob_hat
 
@@ -306,7 +306,7 @@ class QGModel:
         flux_x_hat = self.kx2d*1j*fft2(flux_x_r)
         flux_y_hat = self.ky2d*1j*fft2(flux_y_r)
 
-        return (flux_x_hat + flux_y_hat) * self.dealias_mask
+        return (flux_x_hat + flux_y_hat) #* self.dealias_mask
 
     #TODO self spec_pad
     
