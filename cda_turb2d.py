@@ -10,7 +10,7 @@ import copy
 
 class QGCDA:
     """Continuous Data Assimilation: Nudge model towards reference on full domain"""
-    def __init__(self,m=None,m_ref=None,interpolant='linear',Nobs=256,dTobs=0.1,mu=0.1,is_gnuding=True):
+    def __init__(self,m=None,m_ref=None,interpolant='linear',Nobs=256,dTobs=0.1,mu=0.1,is_gnuding=True,is_not_rst = True,rtrst=0.0):
         """Initialize CDA with model and reference models
         
         Args:
@@ -39,6 +39,8 @@ class QGCDA:
         self.intvl_da = int(round(self.dTobs/self.dt))
         self.mu = mu
         self._init_grid()
+        self.is_not_rst = is_not_rst # whether thr cda run is restart from checkpoint
+        self.rtrst = rtrst # restart time if is_not_rst is False
 
     def _init_grid(self):
         """Initialize observation grid and coordinate mappings"""
@@ -139,16 +141,16 @@ class QGCDA:
         return m_rmse.get()
 
 
-    def create_dns_nc(self,nf):
-        self.m.create_nc(nf,prefix='dns')
+    def create_ctrl_nc(self,nf):
+        self.m.create_nc(nf,prefix='ctrl_o')
         if 'rmse' not in self.m.ds.variables:
-            self.rmse_dns_var = self.m.ds.createVariable('rmse', 'f8', ('time',))
+            self.rmse_ctrl_var = self.m.ds.createVariable('rmse', 'f8', ('time',))
         else:
-            self.rmse_dns_var = self.m.ds.variables['rmse']
+            self.rmse_ctrl_var = self.m.ds.variables['rmse']
 
 
     def create_cda_nc(self,nf):
-        self.m_cda.create_nc(nf,prefix='cda')
+        self.m_cda.create_nc(nf,prefix='cda_o')
         if 'rmse' not in self.m_cda.ds.variables:
             self.rmse_cda_var = self.m_cda.ds.createVariable('rmse', 'f8', ('time',))
             self.Ih_m_var = self.m_cda.ds.createVariable('Ihm', 'f8', ('time', 'y', 'x'))
@@ -160,20 +162,45 @@ class QGCDA:
 
     def create_gnud_nc(self,nf):
         if self.is_gnuding:
-            self.m_gnud.create_nc(nf,prefix='gnud')
+            self.m_gnud.create_nc(nf,prefix='gnud_o')
             if 'rmse' not in self.m_gnud.ds.variables:
                 self.rmse_gnud_var = self.m_gnud.ds.createVariable('rmse', 'f8', ('time',))
             else:
                 self.rmse_gnud_var = self.m_gnud.ds.variables['rmse']
    
     def create_ref_nc(self,nf):
-        self.m_ref.create_nc(nf,prefix='ref')
+        self.m_ref.create_nc(nf,prefix='ref_o')
 
     def create_nc(self,nf):
-        self.create_dns_nc(nf)
+        self.create_ctrl_nc(nf)
         self.create_cda_nc(nf)
         self.create_gnud_nc(nf)
         self.create_ref_nc(nf)
+
+    def create_ctrl_rst(self, nf):
+        self.m.create_rst(nf, prefix='ctrl_r') 
+        if 'tcda' not in self.m.rstds.variables:
+            self.tcda_var = self.m.rstds.createVariable('tcda', 'f8', ('time',))
+        else:
+            self.tcda_var = self.m.rstds.variables['tcda']
+
+    def create_cda_rst(self, nf):     
+        self.m_cda.create_rst(nf, prefix='cda_r')
+        
+    def create_gnud_rst(self, nf):
+        if self.is_gnuding:
+            self.m_gnud.create_rst(nf, prefix='gnud_r')
+            
+    def create_ref_rst(self, nf):
+        self.m_ref.create_rst(nf, prefix='ref_r')
+        
+    def create_rst(self, nf):
+
+        self.m.create_rst(nf, prefix='ctrl_r')
+        self.m_cda.create_rst(nf, prefix='cda_r')
+        if self.is_gnuding:
+            self.m_gnud.create_rst(nf, prefix='gnud_r')
+        self.m_ref.create_rst(nf, prefix='ref_r')
 
     def close_nc(self):
         self.m.ds.close()
@@ -182,10 +209,16 @@ class QGCDA:
             self.m_gnud.ds.close()
         self.m_ref.ds.close()
 
+    def close_rst(self):
+        self.m.rstds.close()
+        self.m_cda.rstds.close()
+        if self.is_gnuding:
+                self.m_gnud.rstds.close()
+        self.m_ref.rstds.close()
     def save_var(self,it):
         """Save variables to netCDF output"""
         self.m.save_var(it)
-        self.rmse_dns_var[it] = self.model_rmse(self.m.q_hat, self.m_ref.q_hat)
+        self.rmse_ctrl_var[it] = self.model_rmse(self.m.q_hat, self.m_ref.q_hat)
         self.m.ds.sync()
 
         self.m_cda.save_var(it)
@@ -200,7 +233,16 @@ class QGCDA:
             self.m_gnud.ds.sync()
 
         self.m_ref.save_var(it)
-    # def save_ref(self,ds):
+        self.m_ref.ds.sync()
+    def save_rst(self,it):
+        """Save restart files"""
+        self.m.save_rst(it)
+        self.tcda_var[it] = self.rt
+        self.m.ds.sync()
+        self.m_cda.save_rst(it)
+        if self.is_gnuding:
+            self.m_gnud.save_rst(it)
+        self.m_ref.save_rst(it)
 
 
 
@@ -226,12 +268,6 @@ class QGCDA:
         if self.is_gnuding:
             self.m_gnud.t = self.m.trst
         self.m_ref.t = self.m_ref.trst 
-        
-        self.m.n_steps = 0
-        self.m_cda.n_steps = 0
-        if self.is_gnuding:
-            self.m_gnud.n_steps = 0
-        self.m_ref.n_steps = 0
 
         self.m.savedir = savedir
         self.m_cda.savedir = savedir
@@ -245,14 +281,57 @@ class QGCDA:
         print(f"Starting CDA. dTobs={self.dTobs}, tmax={tmax}")
         print(f"Step interval -> Model: {self.intvl_model}, Ref: {self.intvl_ref}, Obs: {self.intvl_da}")
 
-        # tsrst = int(1/self.m.dt) # save rst every 1  time unit timestep
-        # nrst = nsave
-        insave=nsave
-        # inrst = nrst
-        nf=0
-        # nfrst=0
+        tsrst = int(1/self.m.dt) # save rst every 1  time unit timestep
+        nrst = nsave
+        # Initialize or continue from restart time
+        if self.is_not_rst:
+            self.rt = cp.float32(0.0)
+            nf0 = 0
+            nfrst0 = 0
+            itsave = 0
+            itrst = 0
+            insave = nsave
+            inrst = nrst
+            n_start = 0
+            nf = nf0
+            nfrst = nfrst0            
+        else:
+            self.rt = self.rtrst
+            # Calculate which file and position to resume from
+            n_start_idx = int(round(self.rtrst / self.dt))
+            hist_saves = n_start_idx // tsave
+            nf0 = hist_saves // nsave
+            itsave = hist_saves % nsave
+            hist_saves_rst = n_start_idx // tsrst
+            nfrst0 = hist_saves_rst // nrst
+            itrst = hist_saves_rst % nrst
+            nf = nf0
+            nfrst = nfrst0
+            # Setup initial file state for restart
+            if itsave == 0:
+                insave = nsave  # Force create_nc next step
+            else:
+                insave = itsave
+                # Open existing file for appending since we're mid-file
+                self.create_nc(nf0)
+                nf+=1
+            # Setup initial restart file state 
+            if itrst == 0:
+                inrst = nrst # Force create_rst next step
+            else:
+                inrst = itrst
+                # Open existing file for appending since we're mid-file
+                self.create_rst(nfrst0)
+                nfrst+=1
+                
+            n_start = n_start_idx
 
-        for n in range(total_steps+1):
+        for n in range(n_start,total_steps+1):
+            self.m.n_steps = n
+            self.m_cda.n_steps = n
+            if self.is_gnuding:
+                self.m_gnud.n_steps = n
+            self.m_ref.n_steps = n
             if n % self.intvl_da == 0:
                 self._step_cda()
                 if self.is_gnuding:
@@ -263,53 +342,39 @@ class QGCDA:
 
                     if insave == nsave:
                         itsave =0 #time index -it
-                        if nf > 0 : 
+                        if nf > nf0 : 
                             self.close_nc()
-                        
                         self.create_nc(nf)
-                        
                         insave=0 #save number index-in
                         nf+=1
                 
                     self.save_var(itsave)
                     
-                    E_dns = self.m.get_Etot(self.m.p_hat)/self.m.Nx/self.m.Ny
+                    E_ctrl = self.m.get_Etot(self.m.p_hat)/self.m.Nx/self.m.Ny
                     E_cda = self.m_cda.get_Etot(self.m_cda.p_hat)/self.m_cda.Nx/self.m_cda.Ny
                     E_gnud = 0.0
                     if self.is_gnuding:
                         E_gnud = self.m_gnud.get_Etot(self.m_gnud.p_hat)/self.m_gnud.Nx/self.m_gnud.Ny
                     E_ref = self.m_ref.get_Etot(self.m_ref.p_hat)/self.m_ref.Nx/self.m_ref.Ny
 
-                    print(f"   step {self.m.n_steps:7d}  t={self.m.t:9.6f}s E_dns={E_dns:.4e} E_cda={E_cda:.4e} E_gnud={E_gnud:.4e} E_ref={E_ref:.4e}", end="\n")
+                    print(f"   step {self.m.n_steps:7d}  t={self.m.t:9.6f}s E_ctrl={E_ctrl:.4e} E_cda={E_cda:.4e} E_gnud={E_gnud:.4e} E_ref={E_ref:.4e}", end="\n")
                     if saveplot:
                         self.m.plot_diag()
                     itsave +=1
                     insave +=1  
-                # if self.m.n_steps % tsrst==0:
-                #     if inrst == nrst:
-                #         itrst =0 #time index -it
-                        
-                #         if nfrst > 0 : 
-                #             self.m.rstds.close()
-                #             self.m_cda.rstds.close()
-                #             self.m_gnud.rstds.close()
-                #             self.m_ref.rstds.close()
-                            
-                #         self.m.create_rst(nfrst)
-                #         self.m_cda.create_rst(nfrst)
-                #         self.m_gnud.create_rst(nfrst)
-                #         self.m_ref.create_rst(nfrst)
-                        
-                #         inrst=0 #save number index-in
-                #         nfrst+=1
+                if self.m.n_steps % tsrst==0:
+                    if inrst == nrst:
+                        itrst =0 #time index -it
+                        if nfrst > nfrst0 : 
+                            self.close_rst()
+                        self.create_rst(nfrst)
+                        inrst=0 #save number index-in
+                        nfrst+=1
 
-                #     self.m.save_rst(itrst)
-                #     self.m_cda.save_rst(itrst)
-                #     self.m_gnud.save_rst(itrst)
-                #     self.m_ref.save_rst(itrst)
+                    self.save_rst(itrst)
                     
-                #     itrst +=1
-                #     inrst +=1
+                    itrst +=1
+                    inrst +=1
 
 
                 self.m._step_forward()

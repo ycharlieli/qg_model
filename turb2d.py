@@ -697,7 +697,7 @@ class QGModel:
         return tefilt_kk, tzfilt_kk, fefilt_kk, fzfilt_kk 
     
     # Save and output methods
-    def create_rst(self,nf):
+    def create_rst(self,nf,prefix='rst'):
         """Create NetCDF file for model state restart data
         
         Stores full vorticity field and time indices for RK4 or AB3 continuation
@@ -706,8 +706,8 @@ class QGModel:
             nf: File counter for restart checkpoint numbering
         """
         outdir = self.savedir
-        # Create restart filename with counter
-        nc_filename = os.path.join(outdir, "rst_%04d.nc"%(nf))
+        # Create restart filename with counter (prefix allows ctrl/cda/gnud/ref)
+        nc_filename = os.path.join(outdir, "%s_%04d.nc" % (prefix, nf))
             
         if os.path.exists(nc_filename):
             # Append to existing file
