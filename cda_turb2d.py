@@ -385,15 +385,15 @@ class QGCDA:
                 self.m_cda.n_steps += 1
                 if self.is_gnuding:
                     self.m_gnud.n_steps += 1
-                self.m.t = self.m.trst + self.m.n_steps * self.m.dt
-                self.m_cda.t = self.m_cda.trst + self.m_cda.n_steps * self.m_cda.dt
+                self.m.t = self.m.t + self.m.dt
+                self.m_cda.t = self.m_cda.t + self.m_cda.dt
                 if self.is_gnuding:
-                    self.m_gnud.t = self.m_gnud.trst + self.m_gnud.n_steps * self.m_gnud.dt
+                    self.m_gnud.t = self.m_gnud.t + self.m_gnud.dt
 
             if n % self.intvl_ref ==0:
                 self.m_ref._step_forward()
                 self.m_ref.n_steps +=1
-                self.m_ref.t = self.m_ref.trst + self.m_ref.n_steps * self.m_ref.dt
+                self.m_ref.t = self.m_ref.t + self.m_ref.dt
         
         self.close_nc()
         
