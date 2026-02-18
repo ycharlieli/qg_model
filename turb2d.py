@@ -1127,7 +1127,7 @@ class QGModel:
         self.plot_diag(save_path=filename)
 
     # Main simulation loop
-    def run(self,scheme='ab3',tmax=40,tsave=200,nsave=100,savedir='run_0',saveplot=False):
+    def run(self,scheme='ab3',tmax=40,tsave=200,tsave_rst=2000,nsave=100,savedir='run_0',saveplot=False):
         """Run main simulation loop with output checkpointing
         
         Integrates model forward in time with periodic diagnostics and restart saves
@@ -1145,8 +1145,7 @@ class QGModel:
         self.tsave = tsave
         self.savedir = savedir
         os.makedirs(self.savedir, exist_ok=True)
-        # Save restart files every 1 time unit
-        tsrst = int(1/self.dt) 
+        self.tsave_rst = tsave_rst
         nrst = nsave
 
         # Initialize or continue from restart time
@@ -1168,7 +1167,7 @@ class QGModel:
             hist_saves = n_start_idx // tsave
             nf0 = hist_saves // nsave
             itsave = hist_saves % nsave
-            hist_saves_rst = n_start_idx // tsrst
+            hist_saves_rst = n_start_idx // tsave_rst
             nfrst0 = hist_saves_rst // nrst
             itrst = hist_saves_rst % nrst
             nf = nf0
@@ -1196,6 +1195,14 @@ class QGModel:
         # Main time integration loop
         for n in range(n_start, int(tmax/self.dt)+1):
             self.n_steps = n
+            # print diagnostics to console every 10,000 steps
+            if n%10000 == 0:
+                # Compute and print energy and diagnostic statistics
+                E_crt = self.get_Etot(self.p_hat)/self.Nx/self.Ny
+                Vrms_crt = self.get_Vrms(self.p_hat)
+                Qrms_crt = self.get_Qrms(self.q_hat)
+                import time
+                print(f"Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}   step {self.n_steps:7d}  t={self.t:9.6f}s E={E_crt:.4e} Vrms={Vrms_crt:.4e} Qrms={Qrms_crt:.4e}", end="\n")
             # Check if need to create new output file
             if insave == nsave:
                 itsave = 0
@@ -1207,20 +1214,15 @@ class QGModel:
             # Save diagnostics at specified intervals
             if n%tsave == 0:
                 self.save_var(itsave)
-                # Compute and print energy and diagnostic statistics
-                E_crt = self.get_Etot(self.p_hat)/self.Nx/self.Ny
-                Vrms_crt = self.get_Vrms(self.p_hat)
-                Qrms_crt = self.get_Qrms(self.q_hat)
                 import time
-                print(f"[save_var] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
-                print(f"   step {self.n_steps:7d}  t={self.t:9.6f}s E={E_crt:.4e} Vrms={Vrms_crt:.4e} Qrms={Qrms_crt:.4e}", end="\n")
+                print(f"[save_var] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}   step {self.n_steps:7d}  t={self.t:9.6f}s ", end="\n")
                 if saveplot:
                     self.plot_diag()
                 itsave +=1
                 insave +=1
 
             # Check if need to create new restart file
-            if self.n_steps % tsrst==0:
+            if self.n_steps % tsave_rst==0:
                 if inrst == nrst:
                     itrst = 0
                     if nfrst > nfrst0:
@@ -1230,6 +1232,8 @@ class QGModel:
                     nfrst += 1
 
                 self.save_rst(itrst)
+                import time
+                print(f"[save_rst] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}   step {self.n_steps:7d}  t={self.t:9.6f}s ", end="\n")
                 itrst += 1
                 inrst += 1
             # Advance model state by one timestep

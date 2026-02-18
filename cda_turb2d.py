@@ -281,11 +281,11 @@ class QGCDA:
         print(f"Starting CDA. dTobs={self.dTobs}, tmax={tmax}")
         print(f"Step interval -> Model: {self.intvl_model}, Ref: {self.intvl_ref}, Obs: {self.intvl_da}")
 
-        tsrst = int(1/self.m.dt) # save rst every 1  time unit timestep
+        tsrst = int(round(1/self.m.dt)) # save rst every 1  time unit timestep
         nrst = nsave
         # Initialize or continue from restart time
         if self.is_not_rst:
-            self.rt = cp.float32(0.0)
+            self.rt = 0.0
             nf0 = 0
             nfrst0 = 0
             itsave = 0
@@ -381,10 +381,6 @@ class QGCDA:
                 self.m_cda._step_forward() 
                 if self.is_gnuding:
                     self.m_gnud._step_forward()
-                self.m.n_steps += 1
-                self.m_cda.n_steps += 1
-                if self.is_gnuding:
-                    self.m_gnud.n_steps += 1
                 self.m.t = self.m.t + self.m.dt
                 self.m_cda.t = self.m_cda.t + self.m_cda.dt
                 if self.is_gnuding:
@@ -392,17 +388,9 @@ class QGCDA:
 
             if n % self.intvl_ref ==0:
                 self.m_ref._step_forward()
-                self.m_ref.n_steps +=1
                 self.m_ref.t = self.m_ref.t + self.m_ref.dt
         
         self.close_nc()
-        
-        # try:
-        #     self.m.rstds.close()
-        #     self.m_cda.rstds.close()
-        #     self.m_gnud.rstds.close()
-        #     self.m_ref.rstds.close()
-        # except:
-        #     pass
-        
+        self.close_rst()
+
         print('Done.')
