@@ -11,8 +11,14 @@ import copy
 class QGCDA:
     """Continuous Data Assimilation: Nudge model towards reference on full domain"""
     def __init__(self, m=None, m_ref=None, interpolant='block', Nobs=256, dTobs=0.1, mu=0.1,
-                 obs_field='q', is_gnuding=True, is_not_rst=True, rtrst=0.0):
-        """Initialize CDA with model and reference models"""
+                 obs_field='q', is_gnuding=True, is_not_rst=True, rtrst=0.0,
+                 obs_spectral_filter=False):
+        """Initialize CDA with model and reference models
+
+        Args:
+            obs_spectral_filter: If True, low-pass filter mapped observations on the
+                model grid so only scales larger than the forcing scale are retained.
+        """
         self.m = m
         self.m_cda = copy.deepcopy(m)
         self.is_gnuding = is_gnuding
@@ -30,6 +36,7 @@ class QGCDA:
         self.intvl_ref = int(round(self.m_ref.dt / self.dt))
         self.intvl_da = int(round(self.dTobs / self.dt))
         self.mu = mu
+        self.obs_spectral_filter = obs_spectral_filter
         self.errspec_eps = 1e-30
         self._init_grid()
         self.is_not_rst = is_not_rst
@@ -55,6 +62,11 @@ class QGCDA:
         ds_x_ref = x_obs_idx * scale_ref
         ds_y_ref = y_obs_idx * scale_ref
         self.coords_ds_ref = cp.array([ds_y_ref, ds_x_ref])
+
+        if self.obs_spectral_filter:
+            self.obs_filter_mask = (self.m.kk <= float(self.m.fscale)).astype(cp.float32)
+        else:
+            self.obs_filter_mask = None
 
     def _get_obs_hat(self, model):
         """Return the spectral field used by the observation operator."""
@@ -96,15 +108,26 @@ class QGCDA:
         self.cda_forcing = self.mu * (self.Ih_ref_q_hat - self.Ih_m_q_hat)
         self.m_cda.da_term = self.cda_forcing
 
+    def _apply_obs_spectral_filter(self, phi):
+        """Low-pass filter a mapped observation field on the model grid."""
+        if self.obs_filter_mask is None:
+            return phi
+        phi_hat = fft2(phi)
+        phi_hat *= self.obs_filter_mask
+        phi_filt = ifft2(phi_hat).real
+        return phi_filt - cp.mean(phi_filt)
+
     def _linear_intp(self, phi):
         """Linear interpolation from observation grid to model grid"""
         phi_intp = map_coordinates(phi, self.rcoord_model, order=1, mode='grid-wrap', prefilter=False)
-        return phi_intp.reshape(self.m.Ny, self.m.Nx)
+        phi_intp = phi_intp.reshape(self.m.Ny, self.m.Nx)
+        return self._apply_obs_spectral_filter(phi_intp)
 
     def _block_intp(self, phi):
         """Block/nearest-neighbor interpolation from observation grid to model grid"""
         phi_intp = map_coordinates(phi, self.rcoord_model, order=0, mode='grid-wrap', prefilter=False)
-        return phi_intp.reshape(self.m.Ny, self.m.Nx)
+        phi_intp = phi_intp.reshape(self.m.Ny, self.m.Nx)
+        return self._apply_obs_spectral_filter(phi_intp)
 
     def _step_gnud(self):
         """Apply strict grid nudging on observation points."""
