@@ -16,6 +16,12 @@ class QGCDA:
         """Initialize CDA with model and reference models
 
         Args:
+            interpolant: Observation operator. Use 'linear'/'block' for
+                subsample-then-interpolate, or 'spec' for direct spectral
+                low-pass assimilation with k_cut = Nobs. Use 'ot2003' for
+                exact low-mode insertion with the same spectral cutoff. Use
+                'zeropad' for coarse-grid sampled observations reconstructed
+                by spectral zero-padding up to the observation Nyquist.
             obs_spectral_filter: If True, low-pass filter mapped observations on the
                 model grid so only scales larger than the forcing scale are retained.
         """
@@ -68,18 +74,31 @@ class QGCDA:
         else:
             self.obs_filter_mask = None
 
+        self.spec_k_cut = float(self.Nobs)
+        self.spec_filter_mask_m = self._build_spec_filter_mask(self.m_cda)
+        self.spec_filter_mask_ref = self._build_spec_filter_mask(self.m_ref)
+
+    def _build_spec_filter_mask(self, model):
+        """Return a low-pass mask with cutoff set directly by Nobs."""
+        k_radius = cp.sqrt(model.nx2d**2 + model.ny2d**2)
+        return (k_radius <= self.spec_k_cut).astype(cp.float32)
+
     def _get_obs_hat(self, model):
         """Return the spectral field used by the observation operator."""
         if self.obs_field == 'q':
             return model.q_hat
         return model.inversion * model.q_hat
 
-    def _obs_to_q_hat(self, obs_field):
-        """Map an observation-space field on the model grid into q-space."""
-        obs_hat = fft2(obs_field)
+    def _obs_hat_to_q_hat(self, obs_hat):
+        """Convert a spectral observation field on the model grid into q-space."""
         if self.obs_field == 'q':
             return obs_hat
         return (self.m_cda.lap - self.m_cda.gamma**2) * obs_hat
+
+    def _obs_to_q_hat(self, obs_field):
+        """Map an observation-space field on the model grid into q-space."""
+        obs_hat = fft2(obs_field)
+        return self._obs_hat_to_q_hat(obs_hat)
 
     def _donwsampling(self, phi_m_hat, phi_ref_hat):
         phi_m_r = ifft2(phi_m_hat).real
@@ -90,23 +109,128 @@ class QGCDA:
         phi_ref_sub = phi_ref_sub - cp.mean(phi_ref_sub)
         return phi_m_sub, phi_ref_sub
 
+    def _project_hat_to_model_grid(self, phi_hat, source_model, target_model):
+        """Crop/pad low-wavenumber Fourier modes onto the target model grid."""
+        if source_model.Nx == target_model.Nx and source_model.Ny == target_model.Ny:
+            return phi_hat
+
+        phi_hat_shift = cp.fft.fftshift(phi_hat)
+        phi_hat_target_shift = cp.zeros((target_model.Ny, target_model.Nx), dtype=phi_hat.dtype)
+
+        copy_ny = min(source_model.Ny, target_model.Ny)
+        copy_nx = min(source_model.Nx, target_model.Nx)
+        src_y0 = (source_model.Ny - copy_ny) // 2
+        src_x0 = (source_model.Nx - copy_nx) // 2
+        tgt_y0 = (target_model.Ny - copy_ny) // 2
+        tgt_x0 = (target_model.Nx - copy_nx) // 2
+
+        phi_hat_target_shift[tgt_y0:tgt_y0 + copy_ny, tgt_x0:tgt_x0 + copy_nx] = (
+            phi_hat_shift[src_y0:src_y0 + copy_ny, src_x0:src_x0 + copy_nx]
+        )
+
+        scale = (target_model.Nx * target_model.Ny) / (source_model.Nx * source_model.Ny)
+        return cp.fft.ifftshift(phi_hat_target_shift) * scale
+
+    def _zeropad_intp(self, phi_obs):
+        """Lift a coarse observation field to the model grid by spectral zero-padding."""
+        phi_obs_hat = fft2(phi_obs)
+        phi_obs_hat_shift = cp.fft.fftshift(phi_obs_hat)
+        phi_hat_model_shift = cp.zeros((self.m_cda.Ny, self.m_cda.Nx), dtype=phi_obs_hat.dtype)
+
+        src_ny, src_nx = phi_obs.shape
+        tgt_ny, tgt_nx = self.m_cda.Ny, self.m_cda.Nx
+        src_y0 = (tgt_ny - src_ny) // 2
+        src_x0 = (tgt_nx - src_nx) // 2
+        phi_hat_model_shift[src_y0:src_y0 + src_ny, src_x0:src_x0 + src_nx] = phi_obs_hat_shift
+
+        scale = (tgt_nx * tgt_ny) / (src_nx * src_ny)
+        phi_hat_model = cp.fft.ifftshift(phi_hat_model_shift) * scale
+        phi_model = ifft2(phi_hat_model).real
+        return phi_model - cp.mean(phi_model), phi_hat_model
+
+    def _spec_intp(self, phi_hat, source_model, spec_filter_mask):
+        """Apply the direct spectral observation operator with k_cut = Nobs."""
+        phi_hat_lp = phi_hat * spec_filter_mask
+        phi_hat_lp = self._project_hat_to_model_grid(phi_hat_lp, source_model, self.m_cda)
+        phi_lp = ifft2(phi_hat_lp).real
+        return phi_lp - cp.mean(phi_lp), phi_hat_lp
+
+    def _ot2003_insert(self, phi_m_hat, phi_ref_hat):
+        """Replace observed low modes exactly following the OT2003-style split."""
+        spec_filter_mask = self.spec_filter_mask_m
+        phi_ref_hat_model = self._project_hat_to_model_grid(phi_ref_hat, self.m_ref, self.m_cda)
+
+        phi_m_obs_hat = phi_m_hat * spec_filter_mask
+        phi_ref_obs_hat = phi_ref_hat_model * spec_filter_mask
+        phi_inserted_hat = phi_m_hat * (1.0 - spec_filter_mask) + phi_ref_obs_hat
+
+        phi_m_obs = ifft2(phi_m_obs_hat).real
+        phi_ref_obs = ifft2(phi_ref_obs_hat).real
+        phi_inserted = ifft2(phi_inserted_hat).real
+
+        return (
+            phi_m_obs - cp.mean(phi_m_obs),
+            phi_ref_obs - cp.mean(phi_ref_obs),
+            phi_inserted - cp.mean(phi_inserted),
+            phi_m_obs_hat,
+            phi_ref_obs_hat,
+            phi_inserted_hat,
+        )
+
     def _step_cda(self):
         """Apply continuous data assimilation nudging."""
         phi_m_hat = self._get_obs_hat(self.m_cda)
         phi_ref_hat = self._get_obs_hat(self.m_ref)
-        phi_m_sub, phi_ref_sub = self._donwsampling(phi_m_hat, phi_ref_hat)
 
-        if self.interpolant == 'linear':
-            self.Ih_m = self._linear_intp(phi_m_sub)
-            self.Ih_ref = self._linear_intp(phi_ref_sub)
+        if self.interpolant == 'spec':
+            self.Ih_m, self.Ih_m_obs_hat = self._spec_intp(
+                phi_m_hat, self.m_cda, self.spec_filter_mask_m
+            )
+            self.Ih_ref, self.Ih_ref_obs_hat = self._spec_intp(
+                phi_ref_hat, self.m_ref, self.spec_filter_mask_ref
+            )
+            self.Ih_m_q_hat = self._obs_hat_to_q_hat(self.Ih_m_obs_hat)
+            self.Ih_ref_q_hat = self._obs_hat_to_q_hat(self.Ih_ref_obs_hat)
+            self.cda_forcing = self.mu * (self.Ih_ref_q_hat - self.Ih_m_q_hat)
+            self.m_cda.da_term = self.cda_forcing
+        elif self.interpolant == 'zeropad':
+            phi_m_sub, phi_ref_sub = self._donwsampling(phi_m_hat, phi_ref_hat)
+            self.Ih_m, self.Ih_m_obs_hat = self._zeropad_intp(phi_m_sub)
+            self.Ih_ref, self.Ih_ref_obs_hat = self._zeropad_intp(phi_ref_sub)
+            self.Ih_m_q_hat = self._obs_hat_to_q_hat(self.Ih_m_obs_hat)
+            self.Ih_ref_q_hat = self._obs_hat_to_q_hat(self.Ih_ref_obs_hat)
+            self.cda_forcing = self.mu * (self.Ih_ref_q_hat - self.Ih_m_q_hat)
+            self.m_cda.da_term = self.cda_forcing
+        elif self.interpolant == 'ot2003':
+            (
+                self.Ih_m,
+                self.Ih_ref,
+                self.Ih_ot,
+                self.Ih_m_obs_hat,
+                self.Ih_ref_obs_hat,
+                self.Ih_ot_obs_hat,
+            ) = self._ot2003_insert(phi_m_hat, phi_ref_hat)
+            self.Ih_m_q_hat = self._obs_hat_to_q_hat(self.Ih_m_obs_hat)
+            self.Ih_ref_q_hat = self._obs_hat_to_q_hat(self.Ih_ref_obs_hat)
+            self.m_cda.q_hat = self._obs_hat_to_q_hat(self.Ih_ot_obs_hat)
+            self.m_cda.p_hat = self.m_cda.inversion * self.m_cda.q_hat
+            self.m_cda.rv_hat = self.m_cda.q_hat + self.m_cda.gamma**2 * self.m_cda.p_hat
+            self.cda_forcing = cp.zeros_like(self.m_cda.q_hat)
+            self.m_cda.da_term = self.cda_forcing
         else:
-            self.Ih_m = self._block_intp(phi_m_sub)
-            self.Ih_ref = self._block_intp(phi_ref_sub)
+            phi_m_sub, phi_ref_sub = self._donwsampling(phi_m_hat, phi_ref_hat)
 
-        self.Ih_m_q_hat = self._obs_to_q_hat(self.Ih_m)
-        self.Ih_ref_q_hat = self._obs_to_q_hat(self.Ih_ref)
-        self.cda_forcing = self.mu * (self.Ih_ref_q_hat - self.Ih_m_q_hat)
-        self.m_cda.da_term = self.cda_forcing
+            if self.interpolant == 'linear':
+                self.Ih_m = self._linear_intp(phi_m_sub)
+                self.Ih_ref = self._linear_intp(phi_ref_sub)
+            else:
+                self.Ih_m = self._block_intp(phi_m_sub)
+                self.Ih_ref = self._block_intp(phi_ref_sub)
+
+            self.Ih_m_q_hat = self._obs_to_q_hat(self.Ih_m)
+            self.Ih_ref_q_hat = self._obs_to_q_hat(self.Ih_ref)
+            self.cda_forcing = self.mu * (self.Ih_ref_q_hat - self.Ih_m_q_hat)
+            self.m_cda.da_term = self.cda_forcing
 
     def _apply_obs_spectral_filter(self, phi):
         """Low-pass filter a mapped observation field on the model grid."""
