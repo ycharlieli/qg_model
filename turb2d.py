@@ -32,10 +32,11 @@ class QGModel:
             hyperorder: Order of hyperviscosity (1=Laplacian, 2=Biharmonic, etc.)
             sp_filtr: Whether to apply spectral filter
             cl: Leith parameter for biharmonic viscosity
-            forcing: Forcing type ('wind', 'thuburn', 'markov', None)
+            forcing: Forcing type ('wind', 'thuburn', 'markov', 'kflow', None)
             fscale: Forcing wavenumber scale
             finput: Forcing enstrophy injection rate
-            famp: Forcing amplitude
+            famp: Forcing amplitude. Ignored for 'kflow', which uses
+                unit-amplitude forcing f = sin(k_f*y)e_x.
         """
         self.Nx = Nx
         self.Ny = Ny
@@ -155,6 +156,8 @@ class QGModel:
 
         if self.forcing == 'markov':
             self._init_markovforce(famp=self.famp)
+        elif self.forcing == 'kflow':
+            self._set_kflow_force()
         
         self._init_friction()
         # preallocate for jacobian  for dealiasing
@@ -218,6 +221,8 @@ class QGModel:
             self.force_q = fft2(0.1*cp.sin(32*np.pi*self.x2d))
         elif self.forcing == 'markov':
             self._update_markovforce()
+        elif self.forcing == 'kflow':
+            self._set_kflow_force()
         q = self.q_hat
 
         if self.ts_scheme=='rk4':
@@ -381,26 +386,35 @@ class QGModel:
                 
             self.rv_hat = self.lap * self.p_hat
             self.q_hat = self.rv_hat - self.gamma**2 * self.p_hat
+        elif scheme == 'kflow':
+            # Kolmogorov-flow CDA starts from q_tilde(0)=0.
+            # The observed low modes p(0) are inserted by cda_turb2d.py:ot2003.
+            self.q_hat = cp.zeros((self.Ny, self.Nx), dtype=cp.complex64)
+            self.p_hat = cp.zeros_like(self.q_hat)
+            self.rv_hat = cp.zeros_like(self.q_hat)
         elif scheme == 'rst':
-            # give initial q field manually
-            # if q_ini[:,:,0].shape[0] > self.Nx:
-            #     # high res ini spectral cut
-            #     q_ini = self.spec_cut(q_ini)
-                
+            # Restart from a saved state. The state may be supplied either as
+            # spectral coefficients (complex -> the new bit-exact format) or as
+            # a physical field (real -> legacy format, lifted via an FFT).
+            q_ini = cp.asarray(q_ini)
+            is_spectral = q_ini.dtype.kind == 'c'
 
+            def _to_qhat(field):
+                if is_spectral:
+                    return field.astype(cp.complex64)
+                return fft2(field.astype(cp.float32))
 
             if q_ini.ndim == 2:
-
-                self.q_hat = fft2(cp.array(q_ini.copy(),dtype=cp.float32))
+                self.q_hat = _to_qhat(q_ini.copy())
                 self.p_hat = self.inversion*self.q_hat
                 self.rv_hat= self.lap*self.p_hat
             elif q_ini.ndim == 3 :
                 self.is_not_rst = False
-                self.q_hat = fft2(cp.array(q_ini[2,:,:].squeeze(),dtype=cp.float32))
+                self.q_hat = _to_qhat(q_ini[2,:,:].squeeze())
                 self.p_hat = self.inversion*self.q_hat
                 self.rv_hat= self.lap*self.p_hat
-                self.k1_p = fft2(cp.array(q_ini[1,:,:].squeeze(),dtype=cp.float32))
-                self.k1_pp  = fft2(cp.array(q_ini[0,:,:].squeeze(), dtype=cp.float32))
+                self.k1_p = _to_qhat(q_ini[1,:,:].squeeze())
+                self.k1_pp  = _to_qhat(q_ini[0,:,:].squeeze())
             if eini:
                 self._norm_energy()
 
@@ -422,6 +436,14 @@ class QGModel:
         self.tenlk, self.tznlk, self.fenlk, self.fznlk = self.get_diagNL(self.p_hat,self.q_hat)   
      
 ### forcing term 
+    def _set_kflow_force(self):
+        # Kolmogorov velocity forcing
+        # f = sin(k_f y) e_x. The vorticity equation receives curl(f).
+        Fq = -self.fscale*cp.cos(self.fscale*self.y2d)
+        Fq = Fq.astype(cp.float32)
+        Fq -= cp.mean(Fq)
+        self.force_q = fft2(Fq)
+
     def _set_windforce(self):
         # graham 2013 and Frezat 2022
         # only valid for 2pi domain
@@ -710,13 +732,13 @@ class QGModel:
         nc_filename = os.path.join(outdir, "%s_%04d.nc" % (prefix, nf))
             
         if os.path.exists(nc_filename):
-            # Append to existing file
-            self.rstds = nc.Dataset(nc_filename, 'a', format='NETCDF4')
+            # Append to existing file (auto_complex so 'qrst' reads/writes as complex)
+            self.rstds = nc.Dataset(nc_filename, 'a', format='NETCDF4', auto_complex=True)
             self.rst_times = self.rstds.variables['time']
             self.qrst_var = self.rstds.variables['qrst']
         else:
             # Create new file
-            self.rstds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
+            self.rstds = nc.Dataset(nc_filename, 'w', format='NETCDF4', auto_complex=True)
             # Create dimensions for time, integration scheme index, and spatial grid
             time_dim = self.rstds.createDimension('time', None) 
             if self.ts_scheme  == 'rk4':
@@ -739,11 +761,15 @@ class QGModel:
             xs[:] = self.x.get()
             ys[:] = self.y.get()
 
-            # Create data variable for vorticity field
-            self.qrst_var = self.rstds.createVariable('qrst', 'f4', ('time','ind', 'y', 'x'), zlib=False)
+            # Create data variable for the spectral vorticity coefficients.
+            # Stored as complex64 (Fourier space) so restart is bit-exact at
+            # working precision, avoiding the FFT round-trip error incurred by
+            # saving in physical space.
+            self.qrst_var = self.rstds.createVariable('qrst', 'c8', ('time','ind', 'y', 'x'), zlib=False)
 
             # Store simulation parameters as global attributes
             self.rstds.description = "QG Turbulence Simulation RST file"
+            self.rstds.rst_space = "spectral"
             self.rstds.dt = self.dt
             self.rstds.Nx = self.Nx
             self.rstds.Ny = self.Ny
@@ -894,30 +920,32 @@ class QGModel:
 
     def save_rst(self,it):
         """Save model state to restart file for integration continuation
-        
-        Stores vorticity and time derivatives required for RK4 or AB3 schemes
-        
+
+        Stores the spectral vorticity coefficients (and the RHS history needed
+        for AB3) directly in Fourier space, so the restart is bit-exact at
+        working precision rather than incurring an FFT round-trip error.
+
         Args:
             it: Output record number index
         """
-        # Transform vorticity and time derivatives to physical space
-        q_r = ifft2(self.q_hat).real.get()
-        k1_p_r = ifft2(self.k1_p).real.get()
-        k1_pp_r = ifft2(self.k1_pp).real.get()
+        # Copy spectral coefficients to host as complex64 (no FFT round trip).
+        q_c = self.q_hat.get().astype(np.complex64)
+        k1_p_c = self.k1_p.get().astype(np.complex64)
+        k1_pp_c = self.k1_pp.get().astype(np.complex64)
         # Record simulation time
         self.rst_times[it] = self.t
         # Store time history based on integration scheme
         if self.ts_scheme == 'ab3':
             # AB3 requires 3 previous steps
-            self.qrst_var[it,0,:,:] = k1_pp_r
-            self.qrst_var[it,1,:,:] = k1_p_r
-            self.qrst_var[it,2,:,:] = q_r
+            self.qrst_var[it,0,:,:] = k1_pp_c
+            self.qrst_var[it,1,:,:] = k1_p_c
+            self.qrst_var[it,2,:,:] = q_c
         elif self.ts_scheme == 'rk4':
             # RK4 only requires current state
-            self.qrst_var[it,0,:,:] = q_r
+            self.qrst_var[it,0,:,:] = q_c
         # Flush to disk
         self.rstds.sync()
-        del q_r, k1_p_r, k1_pp_r
+        del q_c, k1_p_c, k1_pp_c
         gc.collect()
 
 

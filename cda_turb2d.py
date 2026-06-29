@@ -7,12 +7,13 @@ from scipy.fft import set_global_backend
 set_global_backend(cufft)
 import os
 import copy
+import time
 
 class QGCDA:
     """Continuous Data Assimilation: Nudge model towards reference on full domain"""
     def __init__(self, m=None, m_ref=None, interpolant='block', Nobs=256, dTobs=0.1, mu=0.1,
-                 obs_field='q', is_gnuding=True, is_not_rst=True, rtrst=0.0,
-                 obs_spectral_filter=False):
+                 obs_field='q', is_gnuding=False, is_not_rst=True, rtrst=0.0,
+                 obs_spectral_filter=False, is_ctrl=False):
         """Initialize CDA with model and reference models
 
         Args:
@@ -22,11 +23,15 @@ class QGCDA:
                 exact low-mode insertion with the same spectral cutoff. Use
                 'zeropad' for coarse-grid sampled observations reconstructed
                 by spectral zero-padding up to the observation Nyquist.
+            is_gnuding: If True, also run and save the strict grid-nudging
+                comparison trajectory.
             obs_spectral_filter: If True, low-pass filter mapped observations on the
                 model grid so only scales larger than the forcing scale are retained.
+            is_ctrl: If True, also run and save the unnudged control trajectory.
         """
         self.m = m
         self.m_cda = copy.deepcopy(m)
+        self.is_ctrl = is_ctrl
         self.is_gnuding = is_gnuding
         if self.is_gnuding:
             self.m_gnud = copy.deepcopy(m)
@@ -44,6 +49,8 @@ class QGCDA:
         self.mu = mu
         self.obs_spectral_filter = obs_spectral_filter
         self.errspec_eps = 1e-30
+        self.Ih_m = cp.zeros((self.m.Ny, self.m.Nx), dtype=cp.float64)
+        self.Ih_ref = cp.zeros_like(self.Ih_m)
         self._init_grid()
         self.is_not_rst = is_not_rst
         self.rtrst = rtrst
@@ -79,9 +86,9 @@ class QGCDA:
         self.spec_filter_mask_ref = self._build_spec_filter_mask(self.m_ref)
 
     def _build_spec_filter_mask(self, model):
-        """Return a low-pass mask with cutoff set directly by Nobs."""
-        k_radius = cp.sqrt(model.nx2d**2 + model.ny2d**2)
-        return (k_radius <= self.spec_k_cut).astype(cp.float32)
+        """Return a low-pass mask using the same rounded shells as diagnostics."""
+        k_shell = cp.round(cp.sqrt(model.nx2d**2 + model.ny2d**2))
+        return (k_shell <= self.spec_k_cut).astype(cp.float32)
 
     def _get_obs_hat(self, model):
         """Return the spectral field used by the observation operator."""
@@ -313,6 +320,8 @@ class QGCDA:
         return zk_err / np.maximum(0.5 * (zk_model + zk_ref), self.errspec_eps)
 
     def create_ctrl_nc(self, nf):
+        if not self.is_ctrl:
+            return
         self.m.create_nc(nf, prefix='ctrl_o')
         if 'rmse' not in self.m.ds.variables:
             self.rmse_ctrl_var = self.m.ds.createVariable('rmse', 'f8', ('time',))
@@ -376,17 +385,20 @@ class QGCDA:
         self.create_ref_nc(nf)
 
     def create_ctrl_rst(self, nf):
+        if not self.is_ctrl:
+            return
         self.m.create_rst(nf, prefix='ctrl_r') 
-        self._bind_tcda_var()
+        self.tcda_ctrl_var = self._bind_tcda_var(self.m.rstds)
 
-    def _bind_tcda_var(self):
-        if 'tcda' not in self.m.rstds.variables:
-            self.tcda_var = self.m.rstds.createVariable('tcda', 'f8', ('time',))
+    def _bind_tcda_var(self, ds):
+        if 'tcda' not in ds.variables:
+            return ds.createVariable('tcda', 'f8', ('time',))
         else:
-            self.tcda_var = self.m.rstds.variables['tcda']
+            return ds.variables['tcda']
 
     def create_cda_rst(self, nf):     
         self.m_cda.create_rst(nf, prefix='cda_r')
+        self.tcda_cda_var = self._bind_tcda_var(self.m_cda.rstds)
         
     def create_gnud_rst(self, nf):
         if self.is_gnuding:
@@ -397,20 +409,21 @@ class QGCDA:
         
     def create_rst(self, nf):
         self.create_ctrl_rst(nf)
-        self.m_cda.create_rst(nf, prefix='cda_r')
-        if self.is_gnuding:
-            self.m_gnud.create_rst(nf, prefix='gnud_r')
-        self.m_ref.create_rst(nf, prefix='ref_r')
+        self.create_cda_rst(nf)
+        self.create_gnud_rst(nf)
+        self.create_ref_rst(nf)
 
     def close_nc(self):
-        self.m.ds.close()
+        if self.is_ctrl:
+            self.m.ds.close()
         self.m_cda.ds.close()
         if self.is_gnuding:
             self.m_gnud.ds.close()
         self.m_ref.ds.close()
 
     def close_rst(self):
-        self.m.rstds.close()
+        if self.is_ctrl:
+            self.m.rstds.close()
         self.m_cda.rstds.close()
         if self.is_gnuding:
             self.m_gnud.rstds.close()
@@ -418,11 +431,12 @@ class QGCDA:
 
     def save_var(self, it):
         """Save variables to netCDF output"""
-        self.m.save_var(it)
-        self.rmse_ctrl_var[it] = self.model_rmse(self.m.q_hat, self.m_ref.q_hat)
-        self.eerrk_ctrl_var[it, :] = self.get_Eerrk(self.m)
-        self.zerrk_ctrl_var[it, :] = self.get_Zerrk(self.m)
-        self.m.ds.sync()
+        if self.is_ctrl:
+            self.m.save_var(it)
+            self.rmse_ctrl_var[it] = self.model_rmse(self.m.q_hat, self.m_ref.q_hat)
+            self.eerrk_ctrl_var[it, :] = self.get_Eerrk(self.m)
+            self.zerrk_ctrl_var[it, :] = self.get_Zerrk(self.m)
+            self.m.ds.sync()
 
         self.m_cda.save_var(it)
         self.rmse_cda_var[it] = self.model_rmse(self.m_cda.q_hat, self.m_ref.q_hat)
@@ -443,17 +457,21 @@ class QGCDA:
         self.m_ref.ds.sync()
     def save_rst(self,it):
         """Save restart files"""
-        self.m.save_rst(it)
-        self.tcda_var[it] = self.rt
-        self.m.rstds.sync()
+        if self.is_ctrl:
+            self.m.save_rst(it)
+            self.tcda_ctrl_var[it] = self.rt
+            self.m.rstds.sync()
         self.m_cda.save_rst(it)
+        self.tcda_cda_var[it] = self.rt
+        self.m_cda.rstds.sync()
         if self.is_gnuding:
             self.m_gnud.save_rst(it)
         self.m_ref.save_rst(it)
 
     def _set_model_times(self, rt):
         """Set absolute model time = pickup time from spinup + CDA relative time."""
-        self.m.t = self.m.trst + rt
+        if self.is_ctrl:
+            self.m.t = self.m.trst + rt
         self.m_cda.t = self.m_cda.trst + rt
         if self.is_gnuding:
             self.m_gnud.t = self.m_gnud.trst + rt
@@ -473,24 +491,26 @@ class QGCDA:
             savedir: Directory to save output
             saveplot: Whether to save diagnostic plots
         """
-        self.m.ts_scheme     = scheme
+        if self.is_ctrl:
+            self.m.ts_scheme = scheme
         self.m_cda.ts_scheme = scheme
         if self.is_gnuding:
             self.m_gnud.ts_scheme = scheme
         self.m_ref.ts_scheme = scheme
 
-        self.m.savedir = savedir
+        if self.is_ctrl:
+            self.m.savedir = savedir
         self.m_cda.savedir = savedir
         if self.is_gnuding:
             self.m_gnud.savedir = savedir
         self.m_ref.savedir = savedir
-        os.makedirs(self.m.savedir, exist_ok=True)
+        os.makedirs(savedir, exist_ok=True)
         self.tsave_rst = tsave_rst
 
         total_steps = int(round(tmax/self.dt))
 
         print(f"Starting CDA. dTobs={self.dTobs}, tmax={tmax}")
-        print(f"Step interval -> Model: {self.intvl_model}, Ref: {self.intvl_ref}, Obs: {self.intvl_da}")
+        print(f"Step interval -> CDA: {self.intvl_model}, Ref: {self.intvl_ref}, Obs: {self.intvl_da}")
 
         nrst = nsave
         # Initialize or continue from restart time
@@ -542,28 +562,34 @@ class QGCDA:
 
         for n in range(n_start,total_steps+1):
             self.rt = n * self.dt
-            self.m.n_steps = n
+            if self.is_ctrl:
+                self.m.n_steps = n
             self.m_cda.n_steps = n
             if self.is_gnuding:
                 self.m_gnud.n_steps = n
             self.m_ref.n_steps = n
-            if n % self.intvl_da == 0:
-                self._step_cda()
-                if self.is_gnuding:
-                    self._step_gnud()
+            is_da_step = n % self.intvl_da == 0
             # print diagnostics to console every 10,000 steps
             if n%10000 == 0:
                 # Compute and print energy and diagnostic statistics
-                E_ctrl = self.m.get_Etot(self.m.p_hat)/self.m.Nx/self.m.Ny
                 E_cda = self.m_cda.get_Etot(self.m_cda.p_hat)/self.m_cda.Nx/self.m_cda.Ny
-                E_gnud = 0.0
+                E_ref = self.m_ref.get_Etot(self.m_ref.p_hat)/self.m_ref.Nx/self.m_ref.Ny
+                diag_parts = [
+                    f"Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}",
+                    f"step {self.m_cda.n_steps:7d}",
+                    f"t={self.m_cda.t:9.6f}s",
+                ]
+                if self.is_ctrl:
+                    E_ctrl = self.m.get_Etot(self.m.p_hat)/self.m.Nx/self.m.Ny
+                    diag_parts.append(f"E_ctrl={E_ctrl:.4e}")
+                diag_parts.append(f"E_cda={E_cda:.4e}")
                 if self.is_gnuding:
                     E_gnud = self.m_gnud.get_Etot(self.m_gnud.p_hat)/self.m_gnud.Nx/self.m_gnud.Ny
-                E_ref = self.m_ref.get_Etot(self.m_ref.p_hat)/self.m_ref.Nx/self.m_ref.Ny
-                import time
-                print(f"Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}      step {self.m.n_steps:7d}  t={self.m.t:9.6f}s E_ctrl={E_ctrl:.4e} E_cda={E_cda:.4e} E_gnud={E_gnud:.4e} E_ref={E_ref:.4e}", end="\n")
+                    diag_parts.append(f"E_gnud={E_gnud:.4e}")
+                diag_parts.append(f"E_ref={E_ref:.4e}")
+                print("      ".join(diag_parts), end="\n")
             if n % self.intvl_model ==0:
-                if self.m.n_steps % tsave == 0:
+                if self.m_cda.n_steps % tsave == 0:
 
                     if insave == nsave:
                         itsave =0 #time index -it
@@ -574,15 +600,15 @@ class QGCDA:
                         nf+=1
                 
                     self.save_var(itsave)
-                    import time
-                    print(f"[save_var] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}   step {self.m.n_steps:7d}  t={self.m.t:9.6f}s ", end="\n")
+                    print(f"[save_var] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}   step {self.m_cda.n_steps:7d}  t={self.m_cda.t:9.6f}s ", end="\n")
                 
                     
                     if saveplot:
-                        self.m.plot_diag()
+                        plot_model = self.m if self.is_ctrl else self.m_cda
+                        plot_model.plot_diag()
                     itsave +=1
                     insave +=1  
-                if self.m.n_steps % tsave_rst==0:
+                if self.m_cda.n_steps % tsave_rst==0:
                     if inrst == nrst:
                         itrst =0 #time index -it
                         if nfrst > nfrst0 : 
@@ -592,23 +618,36 @@ class QGCDA:
                         nfrst+=1
 
                     self.save_rst(itrst)
-                    import time
-                    print(f"[save_rst] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}   step {self.m.n_steps:7d}  t={self.m.t:9.6f}s ", end="\n")
+                    print(f"[save_rst] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}   step {self.m_cda.n_steps:7d}  t={self.m_cda.t:9.6f}s ", end="\n")
                 
                     itrst +=1
                     inrst +=1
 
+                if is_da_step:
+                    self._step_cda()
+                    if self.is_gnuding:
+                        self._step_gnud()
 
-                self.m._step_forward()
+                if self.is_ctrl:
+                    self.m._step_forward()
                 self.m_cda._step_forward() 
                 if self.is_gnuding:
                     self.m_gnud._step_forward()
+                self.m_cda.da_term[...] = 0.0
+                if self.is_gnuding:
+                    self.m_gnud.da_term[...] = 0.0
                 # Reconstruct absolute model clocks from integer step index.
                 # This avoids cumulative floating-point drift from repeated += dt.
-                self.m.t = self.m.trst + (n + self.intvl_model) * self.dt
+                if self.is_ctrl:
+                    self.m.t = self.m.trst + (n + self.intvl_model) * self.dt
                 self.m_cda.t = self.m_cda.trst + (n + self.intvl_model) * self.dt
                 if self.is_gnuding:
                     self.m_gnud.t = self.m_gnud.trst + (n + self.intvl_model) * self.dt
+
+            elif is_da_step:
+                self._step_cda()
+                if self.is_gnuding:
+                    self._step_gnud()
 
             if n % self.intvl_ref ==0:
                 self.m_ref._step_forward()
