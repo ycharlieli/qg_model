@@ -15,8 +15,8 @@ class QGCLE:
     """Conditional Lyapunov exponent and conditional LLV for QGModel.
 
     Master-slave setup mimicking cda_turb2d.py with the OT2003 exact spectral
-    insertion: at every dTobs the slave's observed modes (rounded shells
-    k <= Nobs) are replaced by the master's, so the error lives entirely in
+    insertion: at every dTobs the slave's observed modes (|k| < Nobs) are
+    replaced by the master's, so the error lives entirely in
     the unobserved subspace (Li et al. 2025b eq. 2.5; Inubushi et al. SM,
     delta_p == 0). The slave starts epsilon-close to the master and the error
     is rescaled back to a fixed small energy norm every dT_cle, the renormalized
@@ -50,15 +50,15 @@ class QGCLE:
     """
 
     def __init__(self, m_ref=None, m_cle=None, Nobs=16, dTobs=None, dT_cle=0.1,
-                 epsilon_rel=1e-6, epsilon_abs=None, seed=10,
+                 epsilon_rel=1e-4, epsilon_abs=None, seed=10,
                  is_not_rst=True, rtrst=0.0):
         """Args:
             m_ref: Master (truth) QGModel with initial condition already set.
             m_cle: Optional slave (pass when resuming from restart files). If
                 None, it is created as deepcopy(m_ref) plus a random
-                streamfunction perturbation confined to shells k > Nobs with
+                streamfunction perturbation confined to modes |k| >= Nobs with
                 energy norm epsilon.
-            Nobs: Observation cutoff wavenumber (rounded shells k <= Nobs are
+            Nobs: Observation cutoff wavenumber (modes with |k| < Nobs are
                 inserted from the master).
             dTobs: Insertion interval; defaults to the model time step.
             dT_cle: Rescaling interval; also the diagnostic save cadence.
@@ -82,10 +82,9 @@ class QGCLE:
         self.rtrst = rtrst
         self.seed = seed
 
-        # observed / unobserved spectral masks with the same rounded shells as
-        # the diagnostics and cda_turb2d
-        k_shell = cp.round(cp.sqrt(m_ref.nx2d**2 + m_ref.ny2d**2))
-        self.obs_mask = (k_shell <= float(Nobs)).astype(cp.float32)
+        k_radius = cp.sqrt(m_ref.nx2d.astype(cp.float64)**2
+                           + m_ref.ny2d.astype(cp.float64)**2)
+        self.obs_mask = (k_radius < float(Nobs)).astype(m_ref.rdtype)
         self.unobs_mask = 1.0 - self.obs_mask
         self.unobs_mask[0, 0] = 0.0
 
@@ -106,6 +105,10 @@ class QGCLE:
             raise ValueError(f"Perturbation norm must be positive, got {self.epsilon}.")
 
         if m_cle is not None:
+            if m_cle.precision != m_ref.precision:
+                raise ValueError(
+                    f"Master and slave precisions differ: {m_ref.precision!r} "
+                    f"vs {m_cle.precision!r}. Build both with the same precision.")
             self.m_cle = m_cle
         else:
             self.m_cle = copy.deepcopy(m_ref)
@@ -115,8 +118,8 @@ class QGCLE:
 
     # ---------------- perturbation and coupling helpers ----------------
     def _make_random_delta(self, mask):
-        noise = cp.random.randn(self.m_ref.Ny, self.m_ref.Nx).astype(cp.float32)
-        delta_psi_hat = fft2(noise).astype(cp.complex64)
+        noise = cp.random.randn(self.m_ref.Ny, self.m_ref.Nx).astype(self.m_ref.rdtype)
+        delta_psi_hat = fft2(noise).astype(self.m_ref.cdtype)
         delta_psi_hat *= mask
         delta_psi_hat[0, 0] = 0.0
         norm = self._enorm(delta_psi_hat)
@@ -202,9 +205,7 @@ class QGCLE:
         return evk, zvk, teadvk, teprodk, tefrick, tevisck, tzadvk, tzprodk, tzfrick, tzvisck
 
     def _rescale(self, fac):
-        """Pull the slave back to distance epsilon from the master. The AB3
-        RHS history difference is rescaled by the same factor so the multistep
-        tangent dynamics stays consistent across the rescale."""
+        """Pull the slave back to distance epsilon from the master."""
         self.m_cle.q_hat = self.m_ref.q_hat + fac * (self.m_cle.q_hat - self.m_ref.q_hat)
         self.m_cle.k1_p = self.m_ref.k1_p + fac * (self.m_cle.k1_p - self.m_ref.k1_p)
         self.m_cle.k1_pp = self.m_ref.k1_pp + fac * (self.m_cle.k1_pp - self.m_ref.k1_pp)
@@ -303,6 +304,7 @@ class QGCLE:
             self.tzvisck_var = self.dds.createVariable('tzvisck', 'f4', ('time', 'k'))
             self._bind_diag_vars()
             self.dds.description = "QG CLE/conditional-LLV diagnostics (master-slave, rescaled)"
+            self.dds.precision = self.m_ref.precision
             self.dds.Nobs = self.Nobs
             self.dds.dTobs = self.dTobs
             self.dds.dT_cle = self.dT
@@ -465,6 +467,22 @@ class QGCLE:
                     os.remove(path)
         self.m_ref.create_rst(nf, prefix='rst_ref')
         self.m_cle.create_rst(nf, prefix='rst_cle')
+        self._stamp_rst_metadata(self.m_ref.rstds, 'ref')
+        self._stamp_rst_metadata(self.m_cle.rstds, 'cle')
+
+    def _stamp_rst_metadata(self, ds, role):
+        ds.cle_role = role
+        ds.cle_precision = self.m_ref.precision
+        ds.cle_Nobs = int(self.Nobs)
+        ds.cle_dTobs = float(self.dTobs)
+        ds.cle_dT_cle = float(self.dT)
+        ds.cle_epsilon = float(self.epsilon)
+        ds.cle_rescale_norm = "energy"
+        ds.cle_dt = float(self.dt)
+        ds.cle_Nx = int(self.m_ref.Nx)
+        ds.cle_Ny = int(self.m_ref.Ny)
+        ds.cle_seed = int(self.seed)
+        ds.sync()
 
     def save_rst(self, it):
         self.m_ref.save_rst(it)

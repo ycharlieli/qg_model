@@ -8,6 +8,7 @@ set_global_backend(cufft)
 import os
 import copy
 import time
+import numpy_groupies as npg
 
 class QGCDA:
     """Continuous Data Assimilation: Nudge model towards reference on full domain"""
@@ -29,6 +30,10 @@ class QGCDA:
                 model grid so only scales larger than the forcing scale are retained.
             is_ctrl: If True, also run and save the unnudged control trajectory.
         """
+        if m is not None and m_ref is not None and m.precision != m_ref.precision:
+            raise ValueError(
+                f"Model and reference precisions differ: {m.precision!r} vs "
+                f"{m_ref.precision!r}. Build both with the same precision.")
         self.m = m
         self.m_cda = copy.deepcopy(m)
         self.is_ctrl = is_ctrl
@@ -51,6 +56,7 @@ class QGCDA:
         self.errspec_eps = 1e-30
         self.Ih_m = cp.zeros((self.m.Ny, self.m.Nx), dtype=cp.float64)
         self.Ih_ref = cp.zeros_like(self.Ih_m)
+        self._shell_cache = {}
         self._init_grid()
         self.is_not_rst = is_not_rst
         self.rtrst = rtrst
@@ -77,7 +83,7 @@ class QGCDA:
         self.coords_ds_ref = cp.array([ds_y_ref, ds_x_ref])
 
         if self.obs_spectral_filter:
-            self.obs_filter_mask = (self.m.kk <= float(self.m.fscale)).astype(cp.float32)
+            self.obs_filter_mask = (self.m.kk <= float(self.m.fscale)).astype(self.m.rdtype)
         else:
             self.obs_filter_mask = None
 
@@ -86,9 +92,10 @@ class QGCDA:
         self.spec_filter_mask_ref = self._build_spec_filter_mask(self.m_ref)
 
     def _build_spec_filter_mask(self, model):
-        """Return a low-pass mask using the same rounded shells as diagnostics."""
-        k_shell = cp.round(cp.sqrt(model.nx2d**2 + model.ny2d**2))
-        return (k_shell <= self.spec_k_cut).astype(cp.float32)
+        """Return a low-pass mask using |k| < Nobs."""
+        k_radius = cp.sqrt(model.nx2d.astype(cp.float64)**2
+                           + model.ny2d.astype(cp.float64)**2)
+        return (k_radius < self.spec_k_cut).astype(model.rdtype)
 
     def _get_obs_hat(self, model):
         """Return the spectral field used by the observation operator."""
@@ -276,20 +283,6 @@ class QGCDA:
         self.Ih_gnud_q_hat = self._obs_to_q_hat(self.gnud_forcing)
         self.m_gnud.da_term = self.mu * self.Ih_gnud_q_hat
 
-    def model_rmse(self, phi_m, phi_ref):
-        """Compute RMSE between model and reference on the model grid."""
-        step_ref = int(self.m_ref.Nx / self.m.Nx)
-        phi_m_r = ifft2(phi_m).real
-        phi_ref_r = ifft2(phi_ref).real
-        phi_ref_sub = phi_ref_r[::step_ref, ::step_ref]
-        if phi_ref_sub.shape != phi_m_r.shape:
-            limit = min(phi_ref_sub.shape[0], phi_m_r.shape[0])
-            phi_ref_sub = phi_ref_sub[:limit, :limit]
-            phi_m_r = phi_m_r[:limit, :limit]
-        diff = phi_m_r - phi_ref_sub
-        m_rmse = cp.sqrt(cp.mean(diff**2))
-        return m_rmse.get()
-
     def _to_mspace(self, phi_hat, source_model, target_model):
         """Return a spectral field represented on the target model grid."""
         if source_model.Nx == target_model.Nx and source_model.Ny == target_model.Ny:
@@ -303,45 +296,160 @@ class QGCDA:
             phi_sub = phi_sub[:target_model.Ny, :target_model.Nx]
         return fft2(phi_sub)
 
-    def get_Eerrk(self, model):
-        """Compute the normalized isotropic energy error spectrum."""
+    def _shell_sum(self, model, dens):
+        """Shell sum using the spatial-average convention from cle_turb2d.py."""
+        key = id(model)
+        if key not in self._shell_cache:
+            self._shell_cache[key] = (
+                model.kk_idx.ravel().get(),
+                model.kk_range.get(),
+                1.0 / (model.Nx * model.Ny) ** 2,
+            )
+        kk_idx_cpu, kk_sel, norm_fac = self._shell_cache[key]
+        return npg.aggregate(kk_idx_cpu, dens.ravel().get(),
+                             func='sum')[kk_sel] * norm_fac
+
+    def _ref_q_hat_on_model(self, model):
+        return self._to_mspace(self.m_ref.q_hat, self.m_ref, model)
+
+    def _delta_hats(self, model):
+        q_ref_hat = self._ref_q_hat_on_model(model)
+        dq_hat = model.q_hat - q_ref_hat
+        dpsi_hat = model.inversion * dq_hat
+        return dq_hat, dpsi_hat, q_ref_hat
+
+    def _finite_error_totals(self, model):
+        """Finite error energy/enstrophy totals using CLE spatial averages."""
+        dq_hat, dpsi_hat, _ = self._delta_hats(model)
+        enorm = self._enorm(model, dpsi_hat)
+        znorm = self._znorm(model, dq_hat)
+        return enorm**2, znorm**2
+
+    def _relative_error_spectra(self, model):
+        """Old eerrk/zerrk diagnostics, renamed rdek/rdzk."""
         p_ref_hat = self._to_mspace(self.m_ref.p_hat, self.m_ref, model)
+        q_ref_hat = self._to_mspace(self.m_ref.q_hat, self.m_ref, model)
         ek_model = np.asarray(model.get_Ek(model.p_hat))
         ek_ref = np.asarray(model.get_Ek(p_ref_hat))
-        ek_err = np.asarray(model.get_Ek(model.p_hat - p_ref_hat))
-        return ek_err / np.maximum(0.5 * (ek_model + ek_ref), self.errspec_eps)
-
-    def get_Zerrk(self, model):
-        """Compute the normalized isotropic enstrophy error spectrum."""
-        q_ref_hat = self._to_mspace(self.m_ref.q_hat, self.m_ref, model)
+        dek = np.asarray(model.get_Ek(model.p_hat - p_ref_hat))
         zk_model = np.asarray(model.get_Zk(model.q_hat))
         zk_ref = np.asarray(model.get_Zk(q_ref_hat))
-        zk_err = np.asarray(model.get_Zk(model.q_hat - q_ref_hat))
-        return zk_err / np.maximum(0.5 * (zk_model + zk_ref), self.errspec_eps)
+        dzk = np.asarray(model.get_Zk(model.q_hat - q_ref_hat))
+        rdek = dek / np.maximum(0.5 * (ek_model + ek_ref), self.errspec_eps)
+        rdzk = dzk / np.maximum(0.5 * (zk_model + zk_ref), self.errspec_eps)
+        return rdek, rdzk
+
+    def _enorm(self, model, dpsi_hat):
+        ene_dens = 0.5 * (model.kk**2 + model.gamma**2) * cp.abs(dpsi_hat)**2
+        ek = self._shell_sum(model, ene_dens)
+        return float(np.sqrt(max(np.sum(ek), 0.0)))
+
+    def _znorm(self, model, dq_hat):
+        ens_dens = 0.5 * cp.abs(dq_hat)**2
+        zk = self._shell_sum(model, ens_dens)
+        return float(np.sqrt(max(np.sum(zk), 0.0)))
+
+    def _err_budget(self, model):
+        """CLE-style normalized error spectra plus finite-amplitude budget term."""
+        dq_hat, dpsi_hat, q_ref_hat = self._delta_hats(model)
+        enorm = self._enorm(model, dpsi_hat)
+        epsi = dpsi_hat / max(enorm, 1e-300)
+        eq = (model.lap - model.gamma**2) * epsi
+        erv = eq + model.gamma**2 * epsi
+        p_ref_hat = model.inversion * q_ref_hat
+
+        evk = self._shell_sum(model, 0.5 * (model.kk**2 + model.gamma**2) * cp.abs(epsi)**2)
+        zvk = self._shell_sum(model, 0.5 * cp.abs(eq)**2)
+
+        j_adv = model._compute_jacobian(p_ref_hat, eq)
+        j_prod = model._compute_jacobian(epsi, q_ref_hat)
+        # Finite-amplitude correction to the linear CLE budget. Since epsi/eq
+        # are normalized by ||delta psi||_E, the quadratic error interaction
+        # enters the normalized error equation multiplied by the raw error norm.
+        j_finite = enorm * model._compute_jacobian(epsi, eq)
+
+        teadvk = self._shell_sum(model, cp.real(cp.conj(epsi) * j_adv))
+        teprodk = self._shell_sum(model, cp.real(cp.conj(epsi) * j_prod))
+        tefinitek = self._shell_sum(model, cp.real(cp.conj(epsi) * j_finite))
+        tzadvk = self._shell_sum(model, -cp.real(cp.conj(eq) * j_adv))
+        tzprodk = self._shell_sum(model, -cp.real(cp.conj(eq) * j_prod))
+        tzfinitek = self._shell_sum(model, -cp.real(cp.conj(eq) * j_finite))
+
+        fric_term = -model.friction_mask * model.friction * erv
+        visc_term = model.hylap * erv
+        tefrick = self._shell_sum(model, -cp.real(cp.conj(epsi) * fric_term))
+        tzfrick = self._shell_sum(model, cp.real(cp.conj(eq) * fric_term))
+        tevisck = self._shell_sum(model, -cp.real(cp.conj(epsi) * visc_term))
+        tzvisck = self._shell_sum(model, cp.real(cp.conj(eq) * visc_term))
+
+        return (evk, zvk, teadvk, teprodk, tefinitek, tefrick, tevisck,
+                tzadvk, tzprodk, tzfinitek, tzfrick, tzvisck)
+
+    def _bind_var(self, ds, name, dtype, dims, description=None):
+        if name in ds.variables:
+            var = ds.variables[name]
+        else:
+            var = ds.createVariable(name, dtype, dims)
+        if description is not None:
+            var.description = description
+        return var
+
+    def _bind_error_diag_vars(self, model):
+        diag = {}
+        diag['de'] = self._bind_var(
+            model.ds, 'de', 'f8', ('time',),
+            'finite error energy, sum_k dek for raw dpsi')
+        diag['dz'] = self._bind_var(
+            model.ds, 'dz', 'f8', ('time',),
+            'finite error enstrophy, Ztot(dq)')
+        for name in ('evk', 'zvk', 'teadvk', 'teprodk', 'tefinitek',
+                     'tefrick', 'tevisck', 'tzadvk', 'tzprodk',
+                     'tzfinitek', 'tzfrick', 'tzvisck', 'tprodk',
+                     'tdissk', 'rdek', 'rdzk'):
+            diag[name] = self._bind_var(model.ds, name, 'f4', ('time', 'k'))
+        diag['evk'].description = 'energy spectrum of energy-normalized error'
+        diag['zvk'].description = 'enstrophy spectrum of energy-normalized error'
+        diag['rdek'].description = 'relative finite energy-error spectrum, old eerrk'
+        diag['rdzk'].description = 'relative finite enstrophy-error spectrum, old zerrk'
+        diag['tefinitek'].description = 'finite-amplitude nonlinear energy error budget term'
+        diag['tzfinitek'].description = 'finite-amplitude nonlinear enstrophy error budget term'
+        diag['tprodk'].description = 'combined energy production teadvk + teprodk + tefinitek'
+        diag['tdissk'].description = 'combined energy dissipation tefrick + tevisck'
+        return diag
+
+    def _save_error_diag(self, model, diag, it):
+        de, dz = self._finite_error_totals(model)
+        rdek, rdzk = self._relative_error_spectra(model)
+        (evk, zvk, teadvk, teprodk, tefinitek, tefrick, tevisck,
+         tzadvk, tzprodk, tzfinitek, tzfrick, tzvisck) = self._err_budget(model)
+        diag['de'][it] = de
+        diag['dz'][it] = dz
+        diag['evk'][it, :] = evk
+        diag['zvk'][it, :] = zvk
+        diag['rdek'][it, :] = rdek
+        diag['rdzk'][it, :] = rdzk
+        diag['teadvk'][it, :] = teadvk
+        diag['teprodk'][it, :] = teprodk
+        diag['tefinitek'][it, :] = tefinitek
+        diag['tefrick'][it, :] = tefrick
+        diag['tevisck'][it, :] = tevisck
+        diag['tzadvk'][it, :] = tzadvk
+        diag['tzprodk'][it, :] = tzprodk
+        diag['tzfinitek'][it, :] = tzfinitek
+        diag['tzfrick'][it, :] = tzfrick
+        diag['tzvisck'][it, :] = tzvisck
+        diag['tprodk'][it, :] = teadvk + teprodk + tefinitek
+        diag['tdissk'][it, :] = tefrick + tevisck
 
     def create_ctrl_nc(self, nf):
         if not self.is_ctrl:
             return
         self.m.create_nc(nf, prefix='ctrl_o')
-        if 'rmse' not in self.m.ds.variables:
-            self.rmse_ctrl_var = self.m.ds.createVariable('rmse', 'f8', ('time',))
-        else:
-            self.rmse_ctrl_var = self.m.ds.variables['rmse']
-        if 'eerrk' not in self.m.ds.variables:
-            self.eerrk_ctrl_var = self.m.ds.createVariable('eerrk', 'f8', ('time', 'k'))
-        else:
-            self.eerrk_ctrl_var = self.m.ds.variables['eerrk']
-        if 'zerrk' not in self.m.ds.variables:
-            self.zerrk_ctrl_var = self.m.ds.createVariable('zerrk', 'f8', ('time', 'k'))
-        else:
-            self.zerrk_ctrl_var = self.m.ds.variables['zerrk']
+        self.errdiag_ctrl_vars = self._bind_error_diag_vars(self.m)
 
     def create_cda_nc(self, nf):
         self.m_cda.create_nc(nf, prefix='cda_o')
-        if 'rmse' not in self.m_cda.ds.variables:
-            self.rmse_cda_var = self.m_cda.ds.createVariable('rmse', 'f8', ('time',))
-        else:
-            self.rmse_cda_var = self.m_cda.ds.variables['rmse']
+        self.errdiag_cda_vars = self._bind_error_diag_vars(self.m_cda)
         if 'Ihm' not in self.m_cda.ds.variables:
             self.Ih_m_var = self.m_cda.ds.createVariable('Ihm', 'f8', ('time', 'y', 'x'))
         else:
@@ -350,30 +458,11 @@ class QGCDA:
             self.Ih_ref_var = self.m_cda.ds.createVariable('Ihref', 'f8', ('time', 'y', 'x'))
         else:
             self.Ih_ref_var = self.m_cda.ds.variables['Ihref']
-        if 'eerrk' not in self.m_cda.ds.variables:
-            self.eerrk_cda_var = self.m_cda.ds.createVariable('eerrk', 'f8', ('time', 'k'))
-        else:
-            self.eerrk_cda_var = self.m_cda.ds.variables['eerrk']
-        if 'zerrk' not in self.m_cda.ds.variables:
-            self.zerrk_cda_var = self.m_cda.ds.createVariable('zerrk', 'f8', ('time', 'k'))
-        else:
-            self.zerrk_cda_var = self.m_cda.ds.variables['zerrk']
 
     def create_gnud_nc(self, nf):
         if self.is_gnuding:
             self.m_gnud.create_nc(nf,prefix='gnud_o')
-            if 'rmse' not in self.m_gnud.ds.variables:
-                self.rmse_gnud_var = self.m_gnud.ds.createVariable('rmse', 'f8', ('time',))
-            else:
-                self.rmse_gnud_var = self.m_gnud.ds.variables['rmse']
-            if 'eerrk' not in self.m_gnud.ds.variables:
-                self.eerrk_gnud_var = self.m_gnud.ds.createVariable('eerrk', 'f8', ('time', 'k'))
-            else:
-                self.eerrk_gnud_var = self.m_gnud.ds.variables['eerrk']
-            if 'zerrk' not in self.m_gnud.ds.variables:
-                self.zerrk_gnud_var = self.m_gnud.ds.createVariable('zerrk', 'f8', ('time', 'k'))
-            else:
-                self.zerrk_gnud_var = self.m_gnud.ds.variables['zerrk']
+            self.errdiag_gnud_vars = self._bind_error_diag_vars(self.m_gnud)
 
     def create_ref_nc(self, nf):
         self.m_ref.create_nc(nf, prefix='ref_o')
@@ -433,24 +522,18 @@ class QGCDA:
         """Save variables to netCDF output"""
         if self.is_ctrl:
             self.m.save_var(it)
-            self.rmse_ctrl_var[it] = self.model_rmse(self.m.q_hat, self.m_ref.q_hat)
-            self.eerrk_ctrl_var[it, :] = self.get_Eerrk(self.m)
-            self.zerrk_ctrl_var[it, :] = self.get_Zerrk(self.m)
+            self._save_error_diag(self.m, self.errdiag_ctrl_vars, it)
             self.m.ds.sync()
 
         self.m_cda.save_var(it)
-        self.rmse_cda_var[it] = self.model_rmse(self.m_cda.q_hat, self.m_ref.q_hat)
+        self._save_error_diag(self.m_cda, self.errdiag_cda_vars, it)
         self.Ih_m_var[it, :, :] = self.Ih_m.get()
         self.Ih_ref_var[it, :, :] = self.Ih_ref.get()
-        self.eerrk_cda_var[it, :] = self.get_Eerrk(self.m_cda)
-        self.zerrk_cda_var[it, :] = self.get_Zerrk(self.m_cda)
         self.m_cda.ds.sync()
 
         if self.is_gnuding:
             self.m_gnud.save_var(it)
-            self.rmse_gnud_var[it] = self.model_rmse(self.m_gnud.q_hat, self.m_ref.q_hat)
-            self.eerrk_gnud_var[it, :] = self.get_Eerrk(self.m_gnud)
-            self.zerrk_gnud_var[it, :] = self.get_Zerrk(self.m_gnud)
+            self._save_error_diag(self.m_gnud, self.errdiag_gnud_vars, it)
             self.m_gnud.ds.sync()
 
         self.m_ref.save_var(it)
@@ -489,7 +572,7 @@ class QGCDA:
             tsave_rst: Steps between restart checkpoint saves
             nsave: Number of saves per file
             savedir: Directory to save output
-            saveplot: Whether to save diagnostic plots
+            saveplot: Ignored compatibility flag; CDA diagnostics are saved to NetCDF only.
         """
         if self.is_ctrl:
             self.m.ts_scheme = scheme
@@ -603,9 +686,6 @@ class QGCDA:
                     print(f"[save_var] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}   step {self.m_cda.n_steps:7d}  t={self.m_cda.t:9.6f}s ", end="\n")
                 
                     
-                    if saveplot:
-                        plot_model = self.m if self.is_ctrl else self.m_cda
-                        plot_model.plot_diag()
                     itsave +=1
                     insave +=1  
                 if self.m_cda.n_steps % tsave_rst==0:

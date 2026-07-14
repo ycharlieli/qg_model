@@ -16,11 +16,11 @@ import os
 class QGModel:
     """2D Quasi-Geostrophic turbulence model with spectral methods"""
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
-                 beta=0, gamma=0, 
+                 beta=0, gamma=0,
                  friction=0.01,k_friction = 20000,hyvisc = 0,hyperorder=1,sp_filtr=False,cl=0,
-                 forcing=None,fscale=4,finput=3,famp=1.):
+                 forcing=None,fscale=4,finput=3,famp=1.,precision='single'):
         """Initialize QG model with grid and parameters
-        
+
         Args:
             Nx, Ny: Grid dimensions
             Lx, Ly: Domain sizes
@@ -37,12 +37,21 @@ class QGModel:
             finput: Forcing enstrophy injection rate
             famp: Forcing amplitude. Ignored for 'kflow', which uses
                 unit-amplitude forcing f = sin(k_f*y)e_x.
+            precision: 'single' (float32/complex64 state, the historical
+                behavior) or 'double' (float64/complex128). Restart files are
+                written at the working precision (c8/c16), so a run cannot
+                resume from a restart of the other precision mid-file.
         """
+        if precision not in ('single', 'double'):
+            raise ValueError(f"precision must be 'single' or 'double', got {precision!r}")
+        self.precision = precision
+        self.rdtype = cp.float32 if precision == 'single' else cp.float64
+        self.cdtype = cp.complex64 if precision == 'single' else cp.complex128
         self.Nx = Nx
         self.Ny = Ny
-        self.Lx = cp.float32(Lx)
-        self.Ly = cp.float32(Ly)
-        self.dt = cp.float32(dt)
+        self.Lx = self.rdtype(Lx)
+        self.Ly = self.rdtype(Ly)
+        self.dt = self.rdtype(dt)
         self._init_grid()
         # QG parameters
         self.beta = beta # Coriolis gradient
@@ -60,15 +69,15 @@ class QGModel:
         self.fscale = fscale # scale of wind
         self.finput = finput # enstrophy injection rate of wind
         self.famp = famp
-        self.force_q = cp.zeros((self.Ny, self.Nx), dtype=cp.complex64)
-        self.da_term = cp.zeros((self.Ny, self.Nx), dtype=cp.complex64)
-        self.k1_p = cp.zeros((self.Ny, self.Nx), dtype=cp.complex64)
-        self.k1_pp = cp.zeros((self.Ny, self.Nx), dtype=cp.complex64)
+        self.force_q = cp.zeros((self.Ny, self.Nx), dtype=self.cdtype)
+        self.da_term = cp.zeros((self.Ny, self.Nx), dtype=self.cdtype)
+        self.k1_p = cp.zeros((self.Ny, self.Nx), dtype=self.cdtype)
+        self.k1_pp = cp.zeros((self.Ny, self.Nx), dtype=self.cdtype)
         self.is_not_rst = True
-        
+
         # Default time-stepping scheme
         self.ts_scheme = 'ab3'
-        self.t = cp.float32(0.0)  # Initialize time
+        self.t = self.rdtype(0.0)  # Initialize time
         self.n_steps = 0  # Initialize step counter
         
         self._prebuild_operator()
@@ -77,25 +86,22 @@ class QGModel:
 ### private term
     def _init_grid(self):
         """Initialize computational grid and wavenumber arrays"""
-        self.x = cp.linspace(0, self.Lx, self.Nx, dtype=cp.float32)
-        self.y = cp.linspace(0, self.Ly, self.Ny, dtype=cp.float32)
+        self.x = cp.linspace(0, self.Lx, self.Nx, dtype=self.rdtype)
+        self.y = cp.linspace(0, self.Ly, self.Ny, dtype=self.rdtype)
         self.x2d, self.y2d = cp.meshgrid(self.x,self.y)
         # Grid indices for FFT
-        nx = cp.arange(self.Nx, dtype=cp.float32); nx[int(self.Nx/2):] -= self.Nx # shift for proper wavenumbers
-        ny = cp.arange(self.Ny, dtype=cp.float32); ny[int(self.Ny/2):] -= self.Ny
+        nx = cp.arange(self.Nx, dtype=self.rdtype); nx[int(self.Nx/2):] -= self.Nx # shift for proper wavenumbers
+        ny = cp.arange(self.Ny, dtype=self.rdtype); ny[int(self.Ny/2):] -= self.Ny
         self.nx2d, self.ny2d = cp.meshgrid(nx,ny)
         # Wavenumbers
-        kx = (2*cp.pi*nx/self.Lx).astype(cp.float32)
-        ky = (2*cp.pi*ny/self.Ly).astype(cp.float32)
+        kx = (2*cp.pi*nx/self.Lx).astype(self.rdtype)
+        ky = (2*cp.pi*ny/self.Ly).astype(self.rdtype)
         # 2D wavenumber arrays
-        self.kx2d, self.ky2d = cp.meshgrid(kx,ky) 
+        self.kx2d, self.ky2d = cp.meshgrid(kx,ky)
         # 2D isotropic wavenumber magnitude
-        self.kk = cp.sqrt(self.kx2d**2+self.ky2d**2).astype(cp.float32) 
+        self.kk = cp.sqrt(self.kx2d**2+self.ky2d**2).astype(self.rdtype)
 
-        # self.kk_intvl = cp.round(self.kk).astype('int')
-        # self.kk_set = cp.unique(self.kk_intvl) # isotropic wavenumber magnitude
-        # self.kk_range  = self.kk_set < cp.sqrt(cp.min(cp.array([(self.kx2d**2).max(),(self.ky2d**2).max()])))
-        # self.kk_iso = self.kk_set[self.kk_range]
+        # Rounded |k| shell index.
         k_bins_grid = cp.round(cp.sqrt(self.nx2d**2 + self.ny2d**2)).astype('int')
         self.kk_idx_set, self.kk_idx = cp.unique(k_bins_grid, return_inverse=True)
         self.kk_set = self.kk_idx_set * (2*cp.pi/self.Lx)
@@ -163,7 +169,7 @@ class QGModel:
         # preallocate for jacobian  for dealiasing
         self.Nxpad = int(3*self.Nx/2)
         self.Nypad = int(3*self.Ny/2)
-        self.pad_buffer = cp.zeros((self.Nxpad,self.Nypad), dtype=cp.complex64)
+        self.pad_buffer = cp.zeros((self.Nxpad,self.Nypad), dtype=self.cdtype)
 
         self.parseval_fac = (self.Nxpad*self.Nypad)/(self.Nx*self.Ny)
         # for truncating in padded field
@@ -346,7 +352,7 @@ class QGModel:
             A = 3-ls
             B = (3-ss-A)/4
             amp = cp.sqrt(self.kk**(-A)*(1 + (self.kk/self.k_peak)**4)**(-B))
-            rand_p = fft2(cp.random.randn(*self.kk.shape).astype(cp.float32))
+            rand_p = fft2(cp.random.randn(*self.kk.shape).astype(self.rdtype))
             rand_p = rand_p*amp
             rand_p[0,0] = 0.0
             self.p_hat = rand_p.copy()
@@ -364,7 +370,7 @@ class QGModel:
             # self._norm_energy()
 
         elif scheme == 'gauss':
-            psi_phys = cp.random.randn(self.Nx, self.Ny).astype(cp.float32)
+            psi_phys = cp.random.randn(self.Nx, self.Ny).astype(self.rdtype)
             rand_p = fft2(psi_phys)
             fmask = cp.zeros_like(self.kk)
         
@@ -389,7 +395,7 @@ class QGModel:
         elif scheme == 'kflow':
             # Kolmogorov-flow CDA starts from q_tilde(0)=0.
             # The observed low modes p(0) are inserted by cda_turb2d.py:ot2003.
-            self.q_hat = cp.zeros((self.Ny, self.Nx), dtype=cp.complex64)
+            self.q_hat = cp.zeros((self.Ny, self.Nx), dtype=self.cdtype)
             self.p_hat = cp.zeros_like(self.q_hat)
             self.rv_hat = cp.zeros_like(self.q_hat)
         elif scheme == 'rst':
@@ -401,8 +407,8 @@ class QGModel:
 
             def _to_qhat(field):
                 if is_spectral:
-                    return field.astype(cp.complex64)
-                return fft2(field.astype(cp.float32))
+                    return field.astype(self.cdtype)
+                return fft2(field.astype(self.rdtype))
 
             if q_ini.ndim == 2:
                 self.q_hat = _to_qhat(q_ini.copy())
@@ -440,7 +446,7 @@ class QGModel:
         # Kolmogorov velocity forcing
         # f = sin(k_f y) e_x. The vorticity equation receives curl(f).
         Fq = -self.fscale*cp.cos(self.fscale*self.y2d)
-        Fq = Fq.astype(cp.float32)
+        Fq = Fq.astype(self.rdtype)
         Fq -= cp.mean(Fq)
         self.force_q = fft2(Fq)
 
@@ -493,16 +499,16 @@ class QGModel:
         # R depends on the timestep dt and correlation time t_r
         # If t_r = 0, R = 0 (White Noise). 
         if t_r == 0:
-            self.fR = cp.float32(0.0)
+            self.fR = self.rdtype(0.0)
         else:
-            self.fR = cp.exp(-self.dt / t_r).astype(cp.float32)
+            self.fR = cp.exp(-self.dt / t_r).astype(self.rdtype)
         self.fseed = 10
         #  Pre-calculate the amplitude coefficient: A * sqrt(1 - R^2)
         # This ensures the variance of the forcing stays constant at A^2 over time.
-        self.fcoef = (norm_fac*famp * cp.sqrt(1 - self.fR**2)).astype(cp.float32)
-        
+        self.fcoef = (norm_fac*famp * cp.sqrt(1 - self.fR**2)).astype(self.rdtype)
+
         # Initialize the forcing field F_{n-1} to zero
-        self.force_q = cp.zeros((self.Nx, self.Ny), dtype=cp.complex64)
+        self.force_q = cp.zeros((self.Nx, self.Ny), dtype=self.cdtype)
 
     def _update_markovforce(self):
         """Update Markovian stochastic forcing with temporal correlation
@@ -515,7 +521,7 @@ class QGModel:
             self.fseed +=1
         else:
             self.fseed = 10
-        noise_phys = cp.random.randn(self.Nx, self.Ny).astype(cp.float32)
+        noise_phys = cp.random.randn(self.Nx, self.Ny).astype(self.rdtype)
         noise_hat = fft2(noise_phys)
         
         # Apply spectral mask to specific wavenumber shell
@@ -736,6 +742,13 @@ class QGModel:
             self.rstds = nc.Dataset(nc_filename, 'a', format='NETCDF4', auto_complex=True)
             self.rst_times = self.rstds.variables['time']
             self.qrst_var = self.rstds.variables['qrst']
+            # Guard against silently mixing precisions in one restart file
+            # (itemsize also matches the compound r/i representation).
+            if self.qrst_var.dtype.itemsize != np.dtype(self.cdtype).itemsize:
+                raise ValueError(
+                    f"Restart file {nc_filename} stores qrst with itemsize "
+                    f"{self.qrst_var.dtype.itemsize}, incompatible with "
+                    f"precision={self.precision!r}. Use a fresh savedir.")
         else:
             # Create new file
             self.rstds = nc.Dataset(nc_filename, 'w', format='NETCDF4', auto_complex=True)
@@ -762,14 +775,16 @@ class QGModel:
             ys[:] = self.y.get()
 
             # Create data variable for the spectral vorticity coefficients.
-            # Stored as complex64 (Fourier space) so restart is bit-exact at
-            # working precision, avoiding the FFT round-trip error incurred by
-            # saving in physical space.
-            self.qrst_var = self.rstds.createVariable('qrst', 'c8', ('time','ind', 'y', 'x'), zlib=False)
+            # Stored at working precision (c8/c16, Fourier space) so restart is
+            # bit-exact, avoiding the FFT round-trip error incurred by saving
+            # in physical space.
+            rst_ctype = 'c8' if self.precision == 'single' else 'c16'
+            self.qrst_var = self.rstds.createVariable('qrst', rst_ctype, ('time','ind', 'y', 'x'), zlib=False)
 
             # Store simulation parameters as global attributes
             self.rstds.description = "QG Turbulence Simulation RST file"
             self.rstds.rst_space = "spectral"
+            self.rstds.precision = self.precision
             self.rstds.dt = self.dt
             self.rstds.Nx = self.Nx
             self.rstds.Ny = self.Ny
@@ -928,10 +943,10 @@ class QGModel:
         Args:
             it: Output record number index
         """
-        # Copy spectral coefficients to host as complex64 (no FFT round trip).
-        q_c = self.q_hat.get().astype(np.complex64)
-        k1_p_c = self.k1_p.get().astype(np.complex64)
-        k1_pp_c = self.k1_pp.get().astype(np.complex64)
+        # Copy spectral coefficients to host at working precision (no FFT round trip).
+        q_c = self.q_hat.get().astype(self.cdtype)
+        k1_p_c = self.k1_p.get().astype(self.cdtype)
+        k1_pp_c = self.k1_pp.get().astype(self.cdtype)
         # Record simulation time
         self.rst_times[it] = self.t
         # Store time history based on integration scheme
@@ -1178,7 +1193,7 @@ class QGModel:
 
         # Initialize or continue from restart time
         if self.is_not_rst:
-            self.t = cp.float32(0.0)
+            self.t = self.rdtype(0.0)
             nf0 = 0
             nfrst0 = 0
             itsave = 0
