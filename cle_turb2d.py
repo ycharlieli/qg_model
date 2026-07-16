@@ -85,10 +85,12 @@ class QGCLE:
         k_radius = cp.sqrt(m_ref.nx2d.astype(cp.float64)**2
                            + m_ref.ny2d.astype(cp.float64)**2)
         self.obs_mask = (k_radius < float(Nobs)).astype(m_ref.rdtype)
+        self.obs_bool = self.obs_mask.astype(cp.bool_)
         self.unobs_mask = 1.0 - self.obs_mask
         self.unobs_mask[0, 0] = 0.0
 
-        # shell-sum bookkeeping reused from the master model
+        # Shell spectra use complete radial shells; scalar reductions below
+        # use the full FFT square.
         self._kk_idx_cpu = m_ref.kk_idx.ravel().get()
         self._kk_sel = m_ref.kk_range.get()
         # Parseval with the unnormalized FFT needs 1/(Nx*Ny)^2 so norms and
@@ -122,20 +124,25 @@ class QGCLE:
         delta_psi_hat = fft2(noise).astype(self.m_ref.cdtype)
         delta_psi_hat *= mask
         delta_psi_hat[0, 0] = 0.0
+        self.m_ref._enforce_spectral_constraints(delta_psi_hat)
         norm = self._enorm(delta_psi_hat)
         if norm <= 0.0:
             raise RuntimeError("Random perturbation has zero energy norm after masking.")
         return self._psi_to_q((self.epsilon / norm) * delta_psi_hat)
 
     def _sync_state(self, model):
+        model._enforce_spectral_constraints(model.q_hat)
         model.p_hat = model.inversion * model.q_hat
-        model.rv_hat = model.q_hat + model.gamma**2 * model.p_hat
+        if model.gamma:
+            model.rv_hat = model.q_hat + model.gamma**2 * model.p_hat
+        else:
+            model.rv_hat = model.q_hat
 
-    def _insert(self):
+    def _insert(self, sync_state=True):
         """OT2003 exact insertion of the observed modes of the master."""
-        self.m_cle.q_hat = (self.m_cle.q_hat * self.unobs_mask
-                            + self.m_ref.q_hat * self.obs_mask)
-        self._sync_state(self.m_cle)
+        cp.copyto(self.m_cle.q_hat, self.m_ref.q_hat, where=self.obs_bool)
+        if sync_state:
+            self._sync_state(self.m_cle)
 
     # ---------------- norms and spectra ----------------
     def _psi_to_q(self, dpsi_hat):
@@ -147,14 +154,14 @@ class QGCLE:
     def _enorm(self, dpsi_hat):
         """Energy norm of a streamfunction perturbation."""
         ene_dens = 0.5 * (self.m_ref.kk**2 + self.m_ref.gamma**2) * cp.abs(dpsi_hat)**2
-        ek = self._shell_sum(ene_dens)
-        return float(np.sqrt(max(np.sum(ek), 0.0)))
+        ene = self._norm_fac * float(cp.sum(ene_dens, dtype=cp.float64).get())
+        return float(np.sqrt(max(ene, 0.0)))
 
     def _znorm(self, dq_hat):
-        """Enstrophy norm consistent with QGModel.get_Ztot (rounded shells)."""
+        """Enstrophy norm of a PV perturbation."""
         ens_dens = 0.5 * cp.abs(dq_hat)**2
-        zk = self._shell_sum(ens_dens)
-        return float(np.sqrt(max(np.sum(zk), 0.0)))
+        ens = self._norm_fac * float(cp.sum(ens_dens, dtype=cp.float64).get())
+        return float(np.sqrt(max(ens, 0.0)))
 
     def _shell_sum(self, dens):
         return npg.aggregate(self._kk_idx_cpu, dens.ravel().get(),
@@ -187,28 +194,55 @@ class QGCLE:
         # advective transfer J(psi_ref, dq) and production J(dpsi, q_ref)
         j_adv = m._compute_jacobian(m.p_hat, eq)
         j_prod = m._compute_jacobian(epsi, m.q_hat)
-        teadvk = self._shell_sum(cp.real(cp.conj(epsi) * j_adv))
-        teprodk = self._shell_sum(cp.real(cp.conj(epsi) * j_prod))
-        tzadvk = self._shell_sum(-cp.real(cp.conj(eq) * j_adv))
-        tzprodk = self._shell_sum(-cp.real(cp.conj(eq) * j_prod))
+        teadv = cp.real(cp.conj(epsi) * j_adv)
+        teprod = cp.real(cp.conj(epsi) * j_prod)
+        tzadv = -cp.real(cp.conj(eq) * j_adv)
+        tzprod = -cp.real(cp.conj(eq) * j_prod)
+        teadvk = self._shell_sum(teadv)
+        teprodk = self._shell_sum(teprod)
+        tzadvk = self._shell_sum(tzadv)
+        tzprodk = self._shell_sum(tzprod)
 
         # linear dissipation acting on the error (beta term is energy-neutral;
         # forcing is identical in both runs and cancels; Leith and the Arbic
         # filter are not included in this budget)
         fric_term = -m.friction_mask * m.friction * erv
         visc_term = m.hylap * erv
-        tefrick = self._shell_sum(-cp.real(cp.conj(epsi) * fric_term))
-        tzfrick = self._shell_sum(cp.real(cp.conj(eq) * fric_term))
-        tevisck = self._shell_sum(-cp.real(cp.conj(epsi) * visc_term))
-        tzvisck = self._shell_sum(cp.real(cp.conj(eq) * visc_term))
+        tefric = -cp.real(cp.conj(epsi) * fric_term)
+        tzfric = cp.real(cp.conj(eq) * fric_term)
+        tevisc = -cp.real(cp.conj(epsi) * visc_term)
+        tzvisc = cp.real(cp.conj(eq) * visc_term)
+        tefrick = self._shell_sum(tefric)
+        tzfrick = self._shell_sum(tzfric)
+        tevisck = self._shell_sum(tevisc)
+        tzvisck = self._shell_sum(tzvisc)
 
-        return evk, zvk, teadvk, teprodk, tefrick, tevisck, tzadvk, tzprodk, tzfrick, tzvisck
+        # Integrated budget terms include every Fourier mode; the saved *k
+        # arrays remain isotropic spectra on complete radial shells.
+        prod_i = 0.5 * self._norm_fac * float(
+            cp.sum(teadv + teprod, dtype=cp.float64).get())
+        diss_i = -0.5 * self._norm_fac * float(
+            cp.sum(tefric + tevisc, dtype=cp.float64).get())
+
+        return (evk, zvk, teadvk, teprodk, tefrick, tevisck,
+                tzadvk, tzprodk, tzfrick, tzvisck, prod_i, diss_i)
+
+    def _herm_project(self, d_hat):
+        """Project a spectral difference onto the Hermitian (real-field)
+        subspace. FFT roundoff seeds an anti-Hermitian component that the
+        .real-based Jacobian cannot see; without this projection repeated
+        rescaling amplifies it into a spurious lam = -(nu k_eff^2 + alpha)
+        mode whenever the physical CLE is more stable than that."""
+        return fft2(ifft2(d_hat).real)
 
     def _rescale(self, fac):
         """Pull the slave back to distance epsilon from the master."""
-        self.m_cle.q_hat = self.m_ref.q_hat + fac * (self.m_cle.q_hat - self.m_ref.q_hat)
-        self.m_cle.k1_p = self.m_ref.k1_p + fac * (self.m_cle.k1_p - self.m_ref.k1_p)
-        self.m_cle.k1_pp = self.m_ref.k1_pp + fac * (self.m_cle.k1_pp - self.m_ref.k1_pp)
+        self.m_cle.q_hat = self.m_ref.q_hat + fac * self._herm_project(
+            self.m_cle.q_hat - self.m_ref.q_hat)
+        self.m_cle.k1_p = self.m_ref.k1_p + fac * self._herm_project(
+            self.m_cle.k1_p - self.m_ref.k1_p)
+        self.m_cle.k1_pp = self.m_ref.k1_pp + fac * self._herm_project(
+            self.m_cle.k1_pp - self.m_ref.k1_pp)
         self._sync_state(self.m_cle)
 
     # ---------------- output ----------------
@@ -240,16 +274,18 @@ class QGCLE:
         self.tzvisck_var = self.dds.variables['tzvisck']
         self.tprodk_var = self._bind_diag_var(
             'tprodk', 'f4', ('time', 'k'),
-            'Li-style combined production spectrum teadvk + teprodk')
+            'Li-style combined production spectrum teadvk + teprodk '
+            'on complete radial shells k < N/2')
         self.tdissk_var = self._bind_diag_var(
             'tdissk', 'f4', ('time', 'k'),
-            'combined energy dissipation tendency tefrick + tevisck')
+            'combined energy dissipation tendency tefrick + tevisck '
+            'on complete radial shells k < N/2')
         self.prodi_var = self._bind_diag_var(
             'prod_i', 'f8', ('time',),
-            'instantaneous 0.5*sum_k(tprodk), comparable to Li production')
+            'instantaneous full-FFT-square production, comparable to Li production')
         self.dissi_var = self._bind_diag_var(
             'diss_i', 'f8', ('time',),
-            'instantaneous -0.5*sum_k(tdissk), positive Li-style dissipation')
+            'instantaneous full-FFT-square positive Li-style dissipation')
         self.lbudgeti_var = self._bind_diag_var(
             'lam_budget_i', 'f8', ('time',),
             'instantaneous prod_i - diss_i, comparable to local lambda')
@@ -360,14 +396,9 @@ class QGCLE:
 
     def save_diag(self, it, t_abs, lam_i, enorm, lam_i_z, znorm, budget):
         (evk, zvk, teadvk, teprodk, tefrick, tevisck,
-         tzadvk, tzprodk, tzfrick, tzvisck) = budget
+         tzadvk, tzprodk, tzfrick, tzvisck, prod_i, diss_i) = budget
         tprodk = teadvk + teprodk
         tdissk = tefrick + tevisck
-        # Our LLV is normalized to energy 1, so the integrated normalized
-        # tendency is 2*lambda. The factor 0.5 maps the scalar budget to Li's
-        # convention where the normalized kinetic energy is 1/2.
-        prod_i = 0.5 * float(np.nansum(tprodk))
-        diss_i = -0.5 * float(np.nansum(tdissk))
         lam_budget_i = prod_i - diss_i
         self.d_times[it] = t_abs
         self.lami_var[it] = lam_i
@@ -595,7 +626,9 @@ class QGCLE:
 
             # exact insertion of the observed modes before anything else
             if n % self.intvl_da == 0:
-                self._insert()
+                # p_hat/rv_hat are rebuilt by the immediately following model
+                # step; interval diagnostics use q_hat directly.
+                self._insert(sync_state=False)
 
             if n % 10000 == 0:
                 E_r = self.m_ref.get_Etot(self.m_ref.p_hat) / self.m_ref.Nx / self.m_ref.Ny

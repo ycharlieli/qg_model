@@ -86,8 +86,10 @@ class QGModel:
 ### private term
     def _init_grid(self):
         """Initialize computational grid and wavenumber arrays"""
-        self.x = cp.linspace(0, self.Lx, self.Nx, dtype=self.rdtype)
-        self.y = cp.linspace(0, self.Ly, self.Ny, dtype=self.rdtype)
+        # FFT grids are periodic samples on [0, L); including both 0 and L
+        # duplicates one point and leaks an integer-wavenumber forcing.
+        self.x = cp.linspace(0, self.Lx, self.Nx, endpoint=False, dtype=self.rdtype)
+        self.y = cp.linspace(0, self.Ly, self.Ny, endpoint=False, dtype=self.rdtype)
         self.x2d, self.y2d = cp.meshgrid(self.x,self.y)
         # Grid indices for FFT
         nx = cp.arange(self.Nx, dtype=self.rdtype); nx[int(self.Nx/2):] -= self.Nx # shift for proper wavenumbers
@@ -166,10 +168,11 @@ class QGModel:
             self._set_kflow_force()
         
         self._init_friction()
+        self.linear_damping = -self.friction_mask*self.friction + self.hylap
         # preallocate for jacobian  for dealiasing
         self.Nxpad = int(3*self.Nx/2)
         self.Nypad = int(3*self.Ny/2)
-        self.pad_buffer = cp.zeros((self.Nxpad,self.Nypad), dtype=self.cdtype)
+        self.pad_buffer = cp.zeros((self.Nypad,self.Nxpad), dtype=self.cdtype)
 
         self.parseval_fac = (self.Nxpad*self.Nypad)/(self.Nx*self.Ny)
         # for truncating in padded field
@@ -177,22 +180,72 @@ class QGModel:
         self.px1= self.px0+self.Nx
         self.py0 = int((self.Nypad-self.Ny)/2)
         self.py1 = self.py0+self.Ny
+        # Powers-of-two use this direct unshifted layout. Besides avoiding
+        # fftshift-sized temporaries, it leaves the ambiguous even-grid
+        # Nyquist row and column at zero.
+        self._direct_padding = (
+            self.Nx % 2 == 0 and self.Ny % 2 == 0
+            and self.Nxpad % 2 == 0 and self.Nypad % 2 == 0
+        )
         
         
     def _padding(self,ft):
         self.pad_buffer.fill(0j)
+        if self._direct_padding:
+            hx = self.Nx // 2
+            hy = self.Ny // 2
+            sx_neg = slice(hx + 1, self.Nx)
+            sy_neg = slice(hy + 1, self.Ny)
+            px_neg = slice(self.Nxpad - hx + 1, self.Nxpad)
+            py_neg = slice(self.Nypad - hy + 1, self.Nypad)
+            cp.multiply(ft[:hy, :hx], self.parseval_fac,
+                        out=self.pad_buffer[:hy, :hx])
+            cp.multiply(ft[:hy, sx_neg], self.parseval_fac,
+                        out=self.pad_buffer[:hy, px_neg])
+            cp.multiply(ft[sy_neg, :hx], self.parseval_fac,
+                        out=self.pad_buffer[py_neg, :hx])
+            cp.multiply(ft[sy_neg, sx_neg], self.parseval_fac,
+                        out=self.pad_buffer[py_neg, px_neg])
+            return self.pad_buffer
+
         #shift zero frequency to center
-        self.pad_buffer[self.px0:self.px1,self.py0:self.py1]=fftshift(ft)  
+        self.pad_buffer[self.py0:self.py1,self.px0:self.px1]=fftshift(ft)
+        if self.Nx % 2 == 0:
+            self.pad_buffer[self.py0:self.py1, self.px0] = 0.0
+        if self.Ny % 2 == 0:
+            self.pad_buffer[self.py0, self.px0:self.px1] = 0.0
         # shift back than the low frequency will back to the edge 
         # garuntee the power is unchange to return the same value, i.e. parseval theorem
-        ft_pad = fftshift(self.parseval_fac*self.pad_buffer) 
-        return ft_pad
+        self.pad_buffer *= self.parseval_fac
+        return fftshift(self.pad_buffer)
 
     def _unpadding(self, ft_pad):
-        
-        ft_shift = fftshift(ft_pad)[self.px0:self.px1,self.py0:self.py1]
+        if self._direct_padding:
+            hx = self.Nx // 2
+            hy = self.Ny // 2
+            sx_neg = slice(hx + 1, self.Nx)
+            sy_neg = slice(hy + 1, self.Ny)
+            px_neg = slice(self.Nxpad - hx + 1, self.Nxpad)
+            py_neg = slice(self.Nypad - hy + 1, self.Nypad)
+            ft = cp.zeros((self.Ny, self.Nx), dtype=ft_pad.dtype)
+            inv_fac = 1.0 / self.parseval_fac
+            cp.multiply(ft_pad[:hy, :hx], inv_fac, out=ft[:hy, :hx])
+            cp.multiply(ft_pad[:hy, px_neg], inv_fac, out=ft[:hy, sx_neg])
+            cp.multiply(ft_pad[py_neg, :hx], inv_fac, out=ft[sy_neg, :hx])
+            cp.multiply(ft_pad[py_neg, px_neg], inv_fac, out=ft[sy_neg, sx_neg])
+            return ft
+
+        ft_shift = fftshift(ft_pad)[self.py0:self.py1,self.px0:self.px1]
         ft = fftshift(ft_shift/self.parseval_fac)
-        
+        return self._enforce_spectral_constraints(ft)
+
+    def _enforce_spectral_constraints(self, ft):
+        """Project a full FFT field onto the unambiguous real-field subspace."""
+        if self.Nx % 2 == 0:
+            ft[:, self.Nx // 2] = 0.0
+        if self.Ny % 2 == 0:
+            ft[self.Ny // 2, :] = 0.0
+        ft[0, 0] = ft[0, 0].real
         return ft
 
         
@@ -202,13 +255,21 @@ class QGModel:
         Returns the tendency from all processes: advection, beta effect, damping
         """
         p_hat = self.inversion*q_hat # invert to get streamfunction
-        rv_hat = q_hat + self.gamma**2*p_hat # relative vorticity
+        if self.gamma:
+            rv_hat = q_hat + self.gamma**2*p_hat # relative vorticity
+        else:
+            rv_hat = q_hat
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
-        beta_term = self.beta*self.kx2d*1j*p_hat
-        damping_term = (-self.friction_mask*self.friction + self.hylap)*rv_hat
-        damping_term+=self._compute_leith_term(rv_hat)
-        
-        return -jacobian_term-beta_term+damping_term+self.force_q+self.da_term
+        damping_term = self.linear_damping*rv_hat
+        if self.cl:
+            damping_term += self._compute_leith_term(rv_hat)
+
+        rhs = damping_term - jacobian_term
+        if self.beta:
+            rhs -= self.beta*self.kx2d*1j*p_hat
+        rhs += self.force_q
+        rhs += self.da_term
+        return self._enforce_spectral_constraints(rhs)
 
     def _rk4(self, q_hat):
         """Compute 4th order Runge-Kutta stages"""
@@ -227,8 +288,8 @@ class QGModel:
             self.force_q = fft2(0.1*cp.sin(32*np.pi*self.x2d))
         elif self.forcing == 'markov':
             self._update_markovforce()
-        elif self.forcing == 'kflow':
-            self._set_kflow_force()
+        # kflow forcing is time independent and was built during __init__.
+        self._enforce_spectral_constraints(self.q_hat)
         q = self.q_hat
 
         if self.ts_scheme=='rk4':
@@ -241,25 +302,29 @@ class QGModel:
                 if self.n_steps == 0:
                     k1,k2,k3,k4 = self._rk4(q)
                     self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-                    self.k1_pp = k1.copy() # store RHS history for AB3
+                    self.k1_pp = k1 # store RHS history for AB3
                 elif self.n_steps == 1:
                     k1,k2,k3,k4 = self._rk4(q)
                     self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-                    self.k1_p = k1.copy()
+                    self.k1_p = k1
                 else:
                     k1 = self._get_rhs(q)
                     self.q_hat = q + self.dt/12*(23*k1-16*self.k1_p+5*self.k1_pp)
                     self.k1_pp = self.k1_p
-                    self.k1_p = k1.copy()
+                    self.k1_p = k1
             else:
                 k1 = self._get_rhs(q)
                 self.q_hat = q + self.dt/12*(23*k1-16*self.k1_p+5*self.k1_pp)
                 self.k1_pp = self.k1_p
-                self.k1_p = k1.copy()
+                self.k1_p = k1
 
         self.q_hat *=self.filtr # apply spectral filter
+        self._enforce_spectral_constraints(self.q_hat)
         self.p_hat = self.inversion*self.q_hat
-        self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
+        if self.gamma:
+            self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
+        else:
+            self.rv_hat = self.q_hat
         
     
     def _compute_jacobian(self,p_hat,q_hat):
@@ -328,6 +393,7 @@ class QGModel:
 
 ### initial term
     def _norm_energy(self):
+            self._enforce_spectral_constraints(self.p_hat)
             self.rv_hat = self.lap*self.p_hat
             # initial potential vorticity (q)
             self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
@@ -437,6 +503,14 @@ class QGModel:
             self.q_hat *=norm_fac
             self.p_hat = self.inversion*self.q_hat
             self.rv_hat = self.lap*self.p_hat
+        self._enforce_spectral_constraints(self.q_hat)
+        self._enforce_spectral_constraints(self.k1_p)
+        self._enforce_spectral_constraints(self.k1_pp)
+        self.p_hat = self.inversion*self.q_hat
+        if self.gamma:
+            self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
+        else:
+            self.rv_hat = self.q_hat
         self.Etot = self.get_Etot(self.p_hat)
         self.Ek = self.get_Ek(self.p_hat)
         self.tenlk, self.tznlk, self.fenlk, self.fznlk = self.get_diagNL(self.p_hat,self.q_hat)   

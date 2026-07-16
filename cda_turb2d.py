@@ -63,8 +63,8 @@ class QGCDA:
 
     def _init_grid(self):
         """Initialize observation grid and coordinate mappings"""
-        self.x_obs = cp.linspace(0, self.m.Lx, self.Nobs)
-        self.y_obs = cp.linspace(0, self.m.Ly, self.Nobs)
+        self.x_obs = cp.linspace(0, self.m.Lx, self.Nobs, endpoint=False)
+        self.y_obs = cp.linspace(0, self.m.Ly, self.Nobs, endpoint=False)
         x_model_idx, y_model_idx = cp.meshgrid(cp.arange(self.m.Nx), cp.arange(self.m.Ny))
         ratio = self.Nobs / self.m.Nx
         rcoord_x = x_model_idx.ravel() * ratio
@@ -90,6 +90,7 @@ class QGCDA:
         self.spec_k_cut = float(self.Nobs)
         self.spec_filter_mask_m = self._build_spec_filter_mask(self.m_cda)
         self.spec_filter_mask_ref = self._build_spec_filter_mask(self.m_ref)
+        self.spec_filter_bool_m = self.spec_filter_mask_m.astype(cp.bool_)
 
     def _build_spec_filter_mask(self, model):
         """Return a low-pass mask using |k| < Nobs."""
@@ -176,20 +177,9 @@ class QGCDA:
 
         phi_m_obs_hat = phi_m_hat * spec_filter_mask
         phi_ref_obs_hat = phi_ref_hat_model * spec_filter_mask
-        phi_inserted_hat = phi_m_hat * (1.0 - spec_filter_mask) + phi_ref_obs_hat
-
-        phi_m_obs = ifft2(phi_m_obs_hat).real
-        phi_ref_obs = ifft2(phi_ref_obs_hat).real
-        phi_inserted = ifft2(phi_inserted_hat).real
-
-        return (
-            phi_m_obs - cp.mean(phi_m_obs),
-            phi_ref_obs - cp.mean(phi_ref_obs),
-            phi_inserted - cp.mean(phi_inserted),
-            phi_m_obs_hat,
-            phi_ref_obs_hat,
-            phi_inserted_hat,
-        )
+        phi_inserted_hat = phi_m_hat.copy()
+        cp.copyto(phi_inserted_hat, phi_ref_hat_model, where=self.spec_filter_bool_m)
+        return phi_m_obs_hat, phi_ref_obs_hat, phi_inserted_hat
 
     def _step_cda(self):
         """Apply continuous data assimilation nudging."""
@@ -217,9 +207,6 @@ class QGCDA:
             self.m_cda.da_term = self.cda_forcing
         elif self.interpolant == 'ot2003':
             (
-                self.Ih_m,
-                self.Ih_ref,
-                self.Ih_ot,
                 self.Ih_m_obs_hat,
                 self.Ih_ref_obs_hat,
                 self.Ih_ot_obs_hat,
@@ -228,9 +215,13 @@ class QGCDA:
             self.Ih_ref_q_hat = self._obs_hat_to_q_hat(self.Ih_ref_obs_hat)
             self.m_cda.q_hat = self._obs_hat_to_q_hat(self.Ih_ot_obs_hat)
             self.m_cda.p_hat = self.m_cda.inversion * self.m_cda.q_hat
-            self.m_cda.rv_hat = self.m_cda.q_hat + self.m_cda.gamma**2 * self.m_cda.p_hat
-            self.cda_forcing = cp.zeros_like(self.m_cda.q_hat)
-            self.m_cda.da_term = self.cda_forcing
+            if self.m_cda.gamma:
+                self.m_cda.rv_hat = (self.m_cda.q_hat
+                                     + self.m_cda.gamma**2 * self.m_cda.p_hat)
+            else:
+                self.m_cda.rv_hat = self.m_cda.q_hat
+            self.m_cda.da_term[...] = 0.0
+            self.cda_forcing = self.m_cda.da_term
         else:
             phi_m_sub, phi_ref_sub = self._donwsampling(phi_m_hat, phi_ref_hat)
 
@@ -297,7 +288,7 @@ class QGCDA:
         return fft2(phi_sub)
 
     def _shell_sum(self, model, dens):
-        """Shell sum using the spatial-average convention from cle_turb2d.py."""
+        """Complete-radial-shell sum using the CLE spatial-average convention."""
         key = id(model)
         if key not in self._shell_cache:
             self._shell_cache[key] = (
@@ -341,13 +332,15 @@ class QGCDA:
 
     def _enorm(self, model, dpsi_hat):
         ene_dens = 0.5 * (model.kk**2 + model.gamma**2) * cp.abs(dpsi_hat)**2
-        ek = self._shell_sum(model, ene_dens)
-        return float(np.sqrt(max(np.sum(ek), 0.0)))
+        norm_fac = 1.0 / (model.Nx * model.Ny) ** 2
+        ene = norm_fac * float(cp.sum(ene_dens, dtype=cp.float64).get())
+        return float(np.sqrt(max(ene, 0.0)))
 
     def _znorm(self, model, dq_hat):
         ens_dens = 0.5 * cp.abs(dq_hat)**2
-        zk = self._shell_sum(model, ens_dens)
-        return float(np.sqrt(max(np.sum(zk), 0.0)))
+        norm_fac = 1.0 / (model.Nx * model.Ny) ** 2
+        ens = norm_fac * float(cp.sum(ens_dens, dtype=cp.float64).get())
+        return float(np.sqrt(max(ens, 0.0)))
 
     def _err_budget(self, model):
         """CLE-style normalized error spectra plus finite-amplitude budget term."""
@@ -398,17 +391,19 @@ class QGCDA:
         diag = {}
         diag['de'] = self._bind_var(
             model.ds, 'de', 'f8', ('time',),
-            'finite error energy, sum_k dek for raw dpsi')
+            'finite error energy, spatial-mean Parseval total over full FFT square')
         diag['dz'] = self._bind_var(
             model.ds, 'dz', 'f8', ('time',),
-            'finite error enstrophy, Ztot(dq)')
+            'finite error enstrophy, spatial-mean Parseval total over full FFT square')
         for name in ('evk', 'zvk', 'teadvk', 'teprodk', 'tefinitek',
                      'tefrick', 'tevisck', 'tzadvk', 'tzprodk',
                      'tzfinitek', 'tzfrick', 'tzvisck', 'tprodk',
                      'tdissk', 'rdek', 'rdzk'):
             diag[name] = self._bind_var(model.ds, name, 'f4', ('time', 'k'))
-        diag['evk'].description = 'energy spectrum of energy-normalized error'
-        diag['zvk'].description = 'enstrophy spectrum of energy-normalized error'
+        diag['evk'].description = ('full-energy-normalized error spectrum on complete '
+                                   'radial shells k < N/2')
+        diag['zvk'].description = ('full-energy-normalized enstrophy spectrum on complete '
+                                   'radial shells k < N/2')
         diag['rdek'].description = 'relative finite energy-error spectrum, old eerrk'
         diag['rdzk'].description = 'relative finite enstrophy-error spectrum, old zerrk'
         diag['tefinitek'].description = 'finite-amplitude nonlinear energy error budget term'
@@ -527,6 +522,11 @@ class QGCDA:
 
         self.m_cda.save_var(it)
         self._save_error_diag(self.m_cda, self.errdiag_cda_vars, it)
+        if self.interpolant == 'ot2003' and hasattr(self, 'Ih_m_obs_hat'):
+            self.Ih_m = ifft2(self.Ih_m_obs_hat).real
+            self.Ih_ref = ifft2(self.Ih_ref_obs_hat).real
+            self.Ih_m -= cp.mean(self.Ih_m)
+            self.Ih_ref -= cp.mean(self.Ih_ref)
         self.Ih_m_var[it, :, :] = self.Ih_m.get()
         self.Ih_ref_var[it, :, :] = self.Ih_ref.get()
         self.m_cda.ds.sync()
