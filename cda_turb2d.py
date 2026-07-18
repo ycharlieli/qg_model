@@ -343,16 +343,19 @@ class QGCDA:
         return float(np.sqrt(max(ens, 0.0)))
 
     def _err_budget(self, model):
-        """CLE-style normalized error spectra plus finite-amplitude budget term."""
+        """Energy-normalized finite-error E/Z/P spectra and budget terms."""
         dq_hat, dpsi_hat, q_ref_hat = self._delta_hats(model)
         enorm = self._enorm(model, dpsi_hat)
         epsi = dpsi_hat / max(enorm, 1e-300)
         eq = (model.lap - model.gamma**2) * epsi
         erv = eq + model.gamma**2 * epsi
         p_ref_hat = model.inversion * q_ref_hat
+        k2 = model.kk**2
 
-        evk = self._shell_sum(model, 0.5 * (model.kk**2 + model.gamma**2) * cp.abs(epsi)**2)
+        evk = self._shell_sum(
+            model, 0.5 * (k2 + model.gamma**2) * cp.abs(epsi)**2)
         zvk = self._shell_sum(model, 0.5 * cp.abs(eq)**2)
+        pvk = self._shell_sum(model, 0.5 * k2 * cp.abs(eq)**2)
 
         j_adv = model._compute_jacobian(p_ref_hat, eq)
         j_prod = model._compute_jacobian(epsi, q_ref_hat)
@@ -361,22 +364,54 @@ class QGCDA:
         # enters the normalized error equation multiplied by the raw error norm.
         j_finite = enorm * model._compute_jacobian(epsi, eq)
 
-        teadvk = self._shell_sum(model, cp.real(cp.conj(epsi) * j_adv))
-        teprodk = self._shell_sum(model, cp.real(cp.conj(epsi) * j_prod))
-        tefinitek = self._shell_sum(model, cp.real(cp.conj(epsi) * j_finite))
-        tzadvk = self._shell_sum(model, -cp.real(cp.conj(eq) * j_adv))
-        tzprodk = self._shell_sum(model, -cp.real(cp.conj(eq) * j_prod))
-        tzfinitek = self._shell_sum(model, -cp.real(cp.conj(eq) * j_finite))
+        teadv = cp.real(cp.conj(epsi) * j_adv)
+        teprod = cp.real(cp.conj(epsi) * j_prod)
+        tefinite = cp.real(cp.conj(epsi) * j_finite)
+        tzadv = -cp.real(cp.conj(eq) * j_adv)
+        tzprod = -cp.real(cp.conj(eq) * j_prod)
+        tzfinite = -cp.real(cp.conj(eq) * j_finite)
+        tpadv = k2 * tzadv
+        tpprod = k2 * tzprod
+        tpfinite = k2 * tzfinite
+
+        teadvk = self._shell_sum(model, teadv)
+        teprodk = self._shell_sum(model, teprod)
+        tefinitek = self._shell_sum(model, tefinite)
+        tzadvk = self._shell_sum(model, tzadv)
+        tzprodk = self._shell_sum(model, tzprod)
+        tzfinitek = self._shell_sum(model, tzfinite)
+        tpadvk = self._shell_sum(model, tpadv)
+        tpprodk = self._shell_sum(model, tpprod)
+        tpfinitek = self._shell_sum(model, tpfinite)
 
         fric_term = -model.friction_mask * model.friction * erv
         visc_term = model.hylap * erv
-        tefrick = self._shell_sum(model, -cp.real(cp.conj(epsi) * fric_term))
-        tzfrick = self._shell_sum(model, cp.real(cp.conj(eq) * fric_term))
-        tevisck = self._shell_sum(model, -cp.real(cp.conj(epsi) * visc_term))
-        tzvisck = self._shell_sum(model, cp.real(cp.conj(eq) * visc_term))
+        tefric = -cp.real(cp.conj(epsi) * fric_term)
+        tzfric = cp.real(cp.conj(eq) * fric_term)
+        tevisc = -cp.real(cp.conj(epsi) * visc_term)
+        tzvisc = cp.real(cp.conj(eq) * visc_term)
+        tpvisc = k2 * tzvisc
 
-        return (evk, zvk, teadvk, teprodk, tefinitek, tefrick, tevisck,
-                tzadvk, tzprodk, tzfinitek, tzfrick, tzvisck)
+        tefrick = self._shell_sum(model, tefric)
+        tzfrick = self._shell_sum(model, tzfric)
+        tevisck = self._shell_sum(model, tevisc)
+        tzvisck = self._shell_sum(model, tzvisc)
+        tpvisck = self._shell_sum(model, tpvisc)
+
+        # DA acts in the raw q equation. Divide it by the raw error energy norm
+        # before contracting it with the energy-normalized error fields.
+        da_err_term = model.da_term / max(enorm, 1e-300)
+        teda_err = -cp.real(cp.conj(epsi) * da_err_term)
+        tzda_err = cp.real(cp.conj(eq) * da_err_term)
+        tpda_err = k2 * tzda_err
+        tedafk = self._shell_sum(model, teda_err)
+        tzdafk = self._shell_sum(model, tzda_err)
+        tpdafk = self._shell_sum(model, tpda_err)
+
+        return (evk, zvk, pvk, teadvk, teprodk, tefinitek, tefrick,
+                tevisck, tzadvk, tzprodk, tzfinitek, tzfrick, tzvisck,
+                tpadvk, tpprodk, tpfinitek, tpvisck, tedafk,
+                tzdafk, tpdafk)
 
     def _bind_var(self, ds, name, dtype, dims, description=None):
         if name in ds.variables:
@@ -395,19 +430,41 @@ class QGCDA:
         diag['dz'] = self._bind_var(
             model.ds, 'dz', 'f8', ('time',),
             'finite error enstrophy, spatial-mean Parseval total over full FFT square')
-        for name in ('evk', 'zvk', 'teadvk', 'teprodk', 'tefinitek',
+        for name in ('evk', 'zvk', 'pvk', 'teadvk', 'teprodk', 'tefinitek',
                      'tefrick', 'tevisck', 'tzadvk', 'tzprodk',
-                     'tzfinitek', 'tzfrick', 'tzvisck', 'tprodk',
-                     'tdissk', 'rdek', 'rdzk'):
+                     'tzfinitek', 'tzfrick', 'tzvisck', 'tpadvk',
+                     'tpprodk', 'tpfinitek', 'tpvisck', 'tedafk',
+                     'tzdafk', 'tpdafk', 'tprodk', 'tdissk',
+                     'rdek', 'rdzk'):
             diag[name] = self._bind_var(model.ds, name, 'f4', ('time', 'k'))
         diag['evk'].description = ('full-energy-normalized error spectrum on complete '
                                    'radial shells k < N/2')
         diag['zvk'].description = ('full-energy-normalized enstrophy spectrum on complete '
                                    'radial shells k < N/2')
+        diag['pvk'].description = ('full-energy-normalized error palinstrophy spectrum '
+                                   '0.5 k^2 |delta q|^2 on complete radial shells k < N/2')
         diag['rdek'].description = 'relative finite energy-error spectrum, old eerrk'
         diag['rdzk'].description = 'relative finite enstrophy-error spectrum, old zerrk'
         diag['tefinitek'].description = 'finite-amplitude nonlinear energy error budget term'
         diag['tzfinitek'].description = 'finite-amplitude nonlinear enstrophy error budget term'
+        diag['tpadvk'].description = ('error palinstrophy tendency from reference-flow '
+                                     'advection on complete radial shells k < N/2')
+        diag['tpprodk'].description = ('error palinstrophy tendency from perturbation '
+                                      'advection of reference q on complete radial shells k < N/2')
+        diag['tpfinitek'].description = ('finite-amplitude nonlinear error palinstrophy '
+                                        'budget term on complete radial shells k < N/2')
+        diag['tpvisck'].description = ('viscous error palinstrophy tendency on complete '
+                                      'radial shells k < N/2; for gamma=0/all-mode drag, '
+                                      'the omitted drag tendency is -2*friction*pvk')
+        diag['tedafk'].description = (
+            'normalized finite-error energy tendency from the instantaneous DA RHS coupling; '
+            'zero for impulsive OT2003 insertion, whose saved state is post-insertion')
+        diag['tzdafk'].description = (
+            'normalized finite-error enstrophy tendency from the instantaneous DA RHS '
+            'coupling; zero for impulsive OT2003 insertion, whose saved state is post-insertion')
+        diag['tpdafk'].description = (
+            'normalized finite-error palinstrophy tendency from the instantaneous DA RHS '
+            'coupling; zero for impulsive OT2003 insertion, whose saved state is post-insertion')
         diag['tprodk'].description = 'combined energy production teadvk + teprodk + tefinitek'
         diag['tdissk'].description = 'combined energy dissipation tefrick + tevisck'
         return diag
@@ -415,12 +472,15 @@ class QGCDA:
     def _save_error_diag(self, model, diag, it):
         de, dz = self._finite_error_totals(model)
         rdek, rdzk = self._relative_error_spectra(model)
-        (evk, zvk, teadvk, teprodk, tefinitek, tefrick, tevisck,
-         tzadvk, tzprodk, tzfinitek, tzfrick, tzvisck) = self._err_budget(model)
+        (evk, zvk, pvk, teadvk, teprodk, tefinitek, tefrick, tevisck,
+         tzadvk, tzprodk, tzfinitek, tzfrick, tzvisck, tpadvk,
+         tpprodk, tpfinitek, tpvisck, tedafk, tzdafk,
+         tpdafk) = self._err_budget(model)
         diag['de'][it] = de
         diag['dz'][it] = dz
         diag['evk'][it, :] = evk
         diag['zvk'][it, :] = zvk
+        diag['pvk'][it, :] = pvk
         diag['rdek'][it, :] = rdek
         diag['rdzk'][it, :] = rdzk
         diag['teadvk'][it, :] = teadvk
@@ -433,17 +493,34 @@ class QGCDA:
         diag['tzfinitek'][it, :] = tzfinitek
         diag['tzfrick'][it, :] = tzfrick
         diag['tzvisck'][it, :] = tzvisck
+        diag['tpadvk'][it, :] = tpadvk
+        diag['tpprodk'][it, :] = tpprodk
+        diag['tpfinitek'][it, :] = tpfinitek
+        diag['tpvisck'][it, :] = tpvisck
+        diag['tedafk'][it, :] = tedafk
+        diag['tzdafk'][it, :] = tzdafk
+        diag['tpdafk'][it, :] = tpdafk
         diag['tprodk'][it, :] = teadvk + teprodk + tefinitek
         diag['tdissk'][it, :] = tefrick + tevisck
+
+    def _set_cda_output_attrs(self, model, role):
+        model.ds.Nobs = self.Nobs
+        model.ds.interpolant = self.interpolant
+        model.ds.mu = self.mu
+        model.ds.obs_field = self.obs_field
+        model.ds.dTobs = self.dTobs
+        model.ds.trajectory_role = role
 
     def create_ctrl_nc(self, nf):
         if not self.is_ctrl:
             return
         self.m.create_nc(nf, prefix='ctrl_o')
+        self._set_cda_output_attrs(self.m, 'control')
         self.errdiag_ctrl_vars = self._bind_error_diag_vars(self.m)
 
     def create_cda_nc(self, nf):
         self.m_cda.create_nc(nf, prefix='cda_o')
+        self._set_cda_output_attrs(self.m_cda, 'assimilated')
         self.errdiag_cda_vars = self._bind_error_diag_vars(self.m_cda)
         if 'Ihm' not in self.m_cda.ds.variables:
             self.Ih_m_var = self.m_cda.ds.createVariable('Ihm', 'f8', ('time', 'y', 'x'))
@@ -453,10 +530,15 @@ class QGCDA:
             self.Ih_ref_var = self.m_cda.ds.createVariable('Ihref', 'f8', ('time', 'y', 'x'))
         else:
             self.Ih_ref_var = self.m_cda.ds.variables['Ihref']
+        self.Ih_m_var.description = ('observation operator applied to the CDA state, '
+                                     f'in {self.obs_field} space')
+        self.Ih_ref_var.description = ('observation operator applied to the reference state, '
+                                       f'in {self.obs_field} space')
 
     def create_gnud_nc(self, nf):
         if self.is_gnuding:
             self.m_gnud.create_nc(nf,prefix='gnud_o')
+            self._set_cda_output_attrs(self.m_gnud, 'grid_nudging')
             self.errdiag_gnud_vars = self._bind_error_diag_vars(self.m_gnud)
 
     def create_ref_nc(self, nf):
@@ -671,6 +753,15 @@ class QGCDA:
                     diag_parts.append(f"E_gnud={E_gnud:.4e}")
                 diag_parts.append(f"E_ref={E_ref:.4e}")
                 print("      ".join(diag_parts), end="\n")
+
+            # Refresh the observation coupling before any coincident output.
+            # OT2003 output is therefore post-insertion, while continuous
+            # nudging output contains the DA term used by the next model step.
+            if is_da_step:
+                self._step_cda()
+                if self.is_gnuding:
+                    self._step_gnud()
+
             if n % self.intvl_model ==0:
                 if self.m_cda.n_steps % tsave == 0:
 
@@ -703,11 +794,6 @@ class QGCDA:
                     itrst +=1
                     inrst +=1
 
-                if is_da_step:
-                    self._step_cda()
-                    if self.is_gnuding:
-                        self._step_gnud()
-
                 if self.is_ctrl:
                     self.m._step_forward()
                 self.m_cda._step_forward() 
@@ -723,11 +809,6 @@ class QGCDA:
                 self.m_cda.t = self.m_cda.trst + (n + self.intvl_model) * self.dt
                 if self.is_gnuding:
                     self.m_gnud.t = self.m_gnud.trst + (n + self.intvl_model) * self.dt
-
-            elif is_da_step:
-                self._step_cda()
-                if self.is_gnuding:
-                    self._step_gnud()
 
             if n % self.intvl_ref ==0:
                 self.m_ref._step_forward()

@@ -17,29 +17,34 @@ class QGCLE:
     Master-slave setup mimicking cda_turb2d.py with the OT2003 exact spectral
     insertion: at every dTobs the slave's observed modes (|k| < Nobs) are
     replaced by the master's, so the error lives entirely in
-    the unobserved subspace (Li et al. 2025b eq. 2.5; Inubushi et al. SM,
-    delta_p == 0). The slave starts epsilon-close to the master and the error
+    the unobserved subspace (Li et al. 2025b, eq. 2.5). The slave starts
+    epsilon-close to the master and the error
     is rescaled back to a fixed small energy norm every dT_cle, the renormalized
     two-trajectory
     method of Boffetta & Musacchio (2017) / Li et al. (2024), so both signs of
     the CLE are measurable indefinitely.
 
-    Every dT_cle the module records the local exponents (Benettin/Inubushi lambda_i)
+    Every dT_cle the module records finite-interval logarithmic growth rates
         lam_i   = ln(||delta||_E / ||delta||_E,prev) / dT_cle
         lam_i_z = ln(||delta||_Z / ||delta||_Z,prev) / dT_cle
     (||.||_E the energy norm, the fixed rescaling norm matching the velocity
-    2-norm used by Li/Inubushi; ||.||_Z the enstrophy norm, i.e. the L2 norm of
+    2-norm used by Li; ||.||_Z the enstrophy norm, i.e. the L2 norm of
     the state q), the running averages lam/lam_z (both estimate the CLE), the
     error norms znorm and enorm (synchronisation error norms of the
-    literature, not RMSE), the normalized error (conditional LLV) energy/enstrophy
-    spectra, and the error budget spectra (advective transfer, production,
-    friction and hyperviscosity dissipation) as in Li et al. (2025b). The
-    diagnostics also save Li-style combined production
+    literature, not RMSE), the normalized error (conditional LLV) energy,
+    enstrophy and PV-gradient palinstrophy spectra, and their exact linearized
+    spectral-budget terms following Li et al. (2025b), adapted to the QG PV
+    equation. No cascade, principal-strain or alignment mechanism is assumed.
+    The diagnostics also save Li-style combined production
     tprodk = teadvk + teprodk and scalar running averages of production,
     dissipation and prod - diss for comparison with lam. Both velocity-based
-    quantities (evk, te*) and q-based diagnostic quantities (zvk, tz*) are
-    evaluated from the same energy-normalized conditional LLV;
-    the q-side diagnostics are not separately normalized to unit enstrophy.
+    quantities (evk, te*) and q-based diagnostic quantities (zvk, pvk, tz*,
+    tp*) are evaluated from the same energy-normalized conditional LLV; the
+    q-side diagnostics are not separately normalized to unit enstrophy or
+    palinstrophy. Palinstrophy densities are weighted by each Fourier mode's
+    exact k^2 before shell aggregation. For the target gamma=0, all-mode-drag
+    runs, the omitted drag tendency is exactly -2*friction*pvk mode by mode;
+    no redundant combined or friction palinstrophy arrays are stored.
     Budget spectra are instantaneous endpoint diagnostics at the save time;
     they are not interval averages of lam_i.
 
@@ -176,10 +181,11 @@ class QGCLE:
         return self._q_to_psi(dq_hat)
 
     def _err_budget(self, dpsi_hat, enorm):
-        """Spectra of the normalized error (conditional LLV) and its energy
-        and enstrophy budget terms, linearized about the master trajectory
-        (Li et al. 2025b eq. 2.27-2.29 adapted to the QG PV equation). Sign
-        conventions follow get_TENL/get_diagFric/get_diagVisc of turb2d.py."""
+        """Spectra of the normalized error (conditional LLV) and its energy,
+        enstrophy and PV-gradient palinstrophy budget terms, linearized about
+        the master trajectory (Li et al. 2025b, eqs. 2.27--2.29, adapted to
+        the QG PV equation). Sign conventions follow
+        get_TENL/get_diagFric/get_diagVisc of turb2d.py."""
         m = self.m_ref
         # Energy-normalized LLV in streamfunction form; q/rv are derived from it
         # only because the QG equation is written for PV.
@@ -187,9 +193,12 @@ class QGCLE:
         eq = self._psi_to_q(epsi)
         erv = eq + m.gamma**2 * epsi
 
-        # normalized error spectra (energy spectrum = conditional LLV spectrum)
+        # Normalized error spectra (energy spectrum = conditional LLV spectrum).
+        # Apply the exact modal k^2 before shell aggregation: rounded shell
+        # centres are not exact substitutes for the modal wavenumbers.
         evk = self._shell_sum(0.5 * (m.kk**2 + m.gamma**2) * cp.abs(epsi)**2)
         zvk = self._shell_sum(0.5 * cp.abs(eq)**2)
+        pvk = self._shell_sum(0.5 * m.kk**2 * cp.abs(eq)**2)
 
         # advective transfer J(psi_ref, dq) and production J(dpsi, q_ref)
         j_adv = m._compute_jacobian(m.p_hat, eq)
@@ -198,10 +207,14 @@ class QGCLE:
         teprod = cp.real(cp.conj(epsi) * j_prod)
         tzadv = -cp.real(cp.conj(eq) * j_adv)
         tzprod = -cp.real(cp.conj(eq) * j_prod)
+        tpadv = m.kk**2 * tzadv
+        tpprod = m.kk**2 * tzprod
         teadvk = self._shell_sum(teadv)
         teprodk = self._shell_sum(teprod)
         tzadvk = self._shell_sum(tzadv)
         tzprodk = self._shell_sum(tzprod)
+        tpadvk = self._shell_sum(tpadv)
+        tpprodk = self._shell_sum(tpprod)
 
         # linear dissipation acting on the error (beta term is energy-neutral;
         # forcing is identical in both runs and cancels; Leith and the Arbic
@@ -212,10 +225,14 @@ class QGCLE:
         tzfric = cp.real(cp.conj(eq) * fric_term)
         tevisc = -cp.real(cp.conj(epsi) * visc_term)
         tzvisc = cp.real(cp.conj(eq) * visc_term)
+        tpvisc = m.kk**2 * tzvisc
+        # Target 2-D NSE runs have gamma=0 and all-mode drag, hence the
+        # unsaved palinstrophy drag tendency is exactly -2*friction*pvk.
         tefrick = self._shell_sum(tefric)
         tzfrick = self._shell_sum(tzfric)
         tevisck = self._shell_sum(tevisc)
         tzvisck = self._shell_sum(tzvisc)
+        tpvisck = self._shell_sum(tpvisc)
 
         # Integrated budget terms include every Fourier mode; the saved *k
         # arrays remain isotropic spectra on complete radial shells.
@@ -224,8 +241,9 @@ class QGCLE:
         diss_i = -0.5 * self._norm_fac * float(
             cp.sum(tefric + tevisc, dtype=cp.float64).get())
 
-        return (evk, zvk, teadvk, teprodk, tefrick, tevisck,
-                tzadvk, tzprodk, tzfrick, tzvisck, prod_i, diss_i)
+        return (evk, zvk, pvk, teadvk, teprodk, tefrick, tevisck,
+                tzadvk, tzprodk, tzfrick, tzvisck,
+                tpadvk, tpprodk, tpvisck, prod_i, diss_i)
 
     def _herm_project(self, d_hat):
         """Project a spectral difference onto the Hermitian (real-field)
@@ -264,6 +282,11 @@ class QGCLE:
         self.znorm_var = self.dds.variables['znorm']
         self.evk_var = self.dds.variables['evk']
         self.zvk_var = self.dds.variables['zvk']
+        self.pvk_var = self._bind_diag_var(
+            'pvk', 'f4', ('time', 'k'),
+            'energy-normalized LLV PV-gradient palinstrophy spectrum; '
+            'modal density 0.5*k_mode^2*|eq|^2 is weighted before the '
+            'complete-radial-shell sum')
         self.teadvk_var = self.dds.variables['teadvk']
         self.teprodk_var = self.dds.variables['teprodk']
         self.tefrick_var = self.dds.variables['tefrick']
@@ -272,6 +295,24 @@ class QGCLE:
         self.tzprodk_var = self.dds.variables['tzprodk']
         self.tzfrick_var = self.dds.variables['tzfrick']
         self.tzvisck_var = self.dds.variables['tzvisck']
+        self.tpadvk_var = self._bind_diag_var(
+            'tpadvk', 'f4', ('time', 'k'),
+            'signed advective tendency of energy-normalized LLV '
+            'PV-gradient palinstrophy, '
+            '-k_mode^2*Re[conj(eq)*J(psi_ref,eq)], weighted before the '
+            'complete-radial-shell sum')
+        self.tpprodk_var = self._bind_diag_var(
+            'tpprodk', 'f4', ('time', 'k'),
+            'signed production tendency of energy-normalized LLV '
+            'PV-gradient palinstrophy, '
+            '-k_mode^2*Re[conj(eq)*J(epsi,q_ref)], weighted before the '
+            'complete-radial-shell sum')
+        self.tpvisck_var = self._bind_diag_var(
+            'tpvisck', 'f4', ('time', 'k'),
+            'signed hyperviscous tendency of energy-normalized LLV '
+            'PV-gradient palinstrophy, '
+            'k_mode^2*Re[conj(eq)*(hylap*erv)], weighted before the '
+            'complete-radial-shell sum')
         self.tprodk_var = self._bind_diag_var(
             'tprodk', 'f4', ('time', 'k'),
             'Li-style combined production spectrum teadvk + teprodk '
@@ -300,6 +341,34 @@ class QGCLE:
             'lam_budget', 'f8', ('time',), 'running mean of lam_budget_i')
         self.lbudget_resid_var = self._bind_diag_var(
             'lam_budget_resid', 'f8', ('time',), 'running lam - lam_budget')
+
+    def _stamp_output_metadata(self, ds):
+        """Add model and spectral conventions to CLE diagnostic/snapshot files."""
+        m = self.m_ref
+        ds.beta = float(m.beta)
+        ds.gamma = float(m.gamma)
+        ds.hyvisc = float(m.hyvisc)
+        ds.hyperorder = int(m.hyperorder)
+        ds.friction = float(m.friction)
+        ds.k_friction = float(m.k_friction)
+        ds.kf = float(m.fscale)
+        ds.cl = float(m.cl)
+        ds.sp_filtr = int(bool(m.sp_filtr))
+        ds.Nx = int(m.Nx)
+        ds.Ny = int(m.Ny)
+        ds.Lx = float(m.Lx)
+        ds.Ly = float(m.Ly)
+        ds.normalization = (
+            'llv = delta_psi/||delta||_E, with ||delta||_E^2 = '
+            '(Nx*Ny)^-2 sum_modes 0.5*(k^2+gamma^2)*|delta_psi_hat|^2; '
+            'spectral arrays are (Nx*Ny)^-2 sums of their stated modal '
+            'densities and all E/Z/P arrays use this energy-normalized llv'
+        )
+        ds.shell_convention = (
+            'rounded radial grid-index shells; k = shell_index*(2*pi/Lx); '
+            'save shell_index < Nx/2; every k-dependent density weight uses '
+            'the exact modal wavenumber before shell aggregation'
+        )
 
     def _adopt_diag_epsilon(self, ds, nc_filename):
         stored_eps = float(ds.epsilon)
@@ -349,6 +418,10 @@ class QGCLE:
             self.dds.seed = self.seed
             self.dds.dt = self.dt
             self.dds.file_index = nf
+        # Also stamp append-open legacy files. Variables created by
+        # _bind_diag_vars above retain fill values at historical records and
+        # are populated only at newly saved restart records.
+        self._stamp_output_metadata(self.dds)
 
     def _init_lam_sums(self, n_diag_done, nsave, prefix='cle_d'):
         self._lam_sum = 0.0
@@ -395,8 +468,9 @@ class QGCLE:
             nf += 1
 
     def save_diag(self, it, t_abs, lam_i, enorm, lam_i_z, znorm, budget):
-        (evk, zvk, teadvk, teprodk, tefrick, tevisck,
-         tzadvk, tzprodk, tzfrick, tzvisck, prod_i, diss_i) = budget
+        (evk, zvk, pvk, teadvk, teprodk, tefrick, tevisck,
+         tzadvk, tzprodk, tzfrick, tzvisck,
+         tpadvk, tpprodk, tpvisck, prod_i, diss_i) = budget
         tprodk = teadvk + teprodk
         tdissk = tefrick + tevisck
         lam_budget_i = prod_i - diss_i
@@ -414,6 +488,7 @@ class QGCLE:
         self.znorm_var[it] = znorm
         self.evk_var[it, :] = evk
         self.zvk_var[it, :] = zvk
+        self.pvk_var[it, :] = pvk
         self.teadvk_var[it, :] = teadvk
         self.teprodk_var[it, :] = teprodk
         self.tefrick_var[it, :] = tefrick
@@ -424,6 +499,9 @@ class QGCLE:
         self.tzprodk_var[it, :] = tzprodk
         self.tzfrick_var[it, :] = tzfrick
         self.tzvisck_var[it, :] = tzvisck
+        self.tpadvk_var[it, :] = tpadvk
+        self.tpprodk_var[it, :] = tpprodk
+        self.tpvisck_var[it, :] = tpvisck
         self.prodi_var[it] = prod_i
         self.dissi_var[it] = diss_i
         self.lbudgeti_var[it] = lam_budget_i
@@ -476,6 +554,7 @@ class QGCLE:
             self.ds.epsilon = self.epsilon
             self.ds.rescale_norm = "energy"
             self.ds.llv_description = "delta_psi normalized by the energy norm"
+        self._stamp_output_metadata(self.ds)
 
     def save_var(self, it):
         self.times[it] = self.m_ref.t
