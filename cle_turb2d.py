@@ -11,6 +11,13 @@ import copy
 import time
 
 
+TRANSFER_ELAPSED_START = 700.0
+TRANSFER_ELAPSED_STOP = 900.0
+TRANSFER_SUBDIR = "strain_velocity_production_elapsed_t0700_t0900"
+TRANSFER_REVISION = "cle-runtime-l2-f64-2026-07-28-v1"
+ALIGNMENT_RELATIVE_FLOOR = 1.0e-14
+
+
 class QGCLE:
     """Conditional Lyapunov exponent and conditional LLV for QGModel.
 
@@ -19,18 +26,15 @@ class QGCLE:
     replaced by the master's, so the error lives entirely in
     the unobserved subspace (Li et al. 2025b, eq. 2.5). The slave starts
     epsilon-close to the master and the error
-    is rescaled back to a fixed small energy norm every dT_cle, the renormalized
+    is rescaled back to a fixed small velocity L2 norm every dT_cle, the renormalized
     two-trajectory
     method of Boffetta & Musacchio (2017) / Li et al. (2024), so both signs of
     the CLE are measurable indefinitely.
 
     Every dT_cle the module records finite-interval logarithmic growth rates
-        lam_i   = ln(||delta||_E / ||delta||_E,prev) / dT_cle
-        lam_i_z = ln(||delta||_Z / ||delta||_Z,prev) / dT_cle
-    (||.||_E the energy norm, the fixed rescaling norm matching the velocity
-    2-norm used by Li; ||.||_Z the enstrophy norm, i.e. the L2 norm of
-    the state q), the running averages lam/lam_z (both estimate the CLE), the
-    error norms znorm and enorm (synchronisation error norms of the
+        lam_i   = ln(||delta||_2 / ||delta||_2,prev) / dT_cle
+    (||.||_2^2 = <|v|^2>, the fixed rescaling norm), the running average
+    lam, and the error norm l2norm (a synchronisation error norm of the
     literature, not RMSE), the normalized error (conditional LLV) energy,
     enstrophy and PV-gradient palinstrophy spectra, and their exact linearized
     spectral-budget terms following Li et al. (2025b), adapted to the QG PV
@@ -39,7 +43,7 @@ class QGCLE:
     tprodk = teadvk + teprodk and scalar running averages of production,
     dissipation and prod - diss for comparison with lam. Both velocity-based
     quantities (evk, te*) and q-based diagnostic quantities (zvk, pvk, tz*,
-    tp*) are evaluated from the same energy-normalized conditional LLV; the
+    tp*) are evaluated from the same velocity-L2-normalized conditional LLV; the
     q-side diagnostics are not separately normalized to unit enstrophy or
     palinstrophy. Palinstrophy densities are weighted by each Fourier mode's
     exact k^2 before shell aggregation. For the target gamma=0, all-mode-drag
@@ -49,8 +53,8 @@ class QGCLE:
     they are not interval averages of lam_i.
 
     Snapshots save q of the master, raw delta_psi and delta_q, and the
-    energy-normalized streamfunction error field
-    llv = delta_psi/||delta||_E; no flux diagnostics, Ihm/Ihref or daF are
+    velocity-L2-normalized streamfunction error field
+    llv = delta_psi/||delta||_2; no flux diagnostics, Ihm/Ihref or daF are
     saved.
     """
 
@@ -62,13 +66,13 @@ class QGCLE:
             m_cle: Optional slave (pass when resuming from restart files). If
                 None, it is created as deepcopy(m_ref) plus a random
                 streamfunction perturbation confined to modes |k| >= Nobs with
-                energy norm epsilon.
+                velocity L2 norm epsilon.
             Nobs: Observation cutoff wavenumber (modes with |k| < Nobs are
                 inserted from the master).
             dTobs: Insertion interval; defaults to the model time step.
             dT_cle: Rescaling interval; also the diagnostic save cadence.
-            epsilon_rel: Perturbation energy norm relative to the master state.
-            epsilon_abs: Absolute perturbation energy norm (overrides rel).
+            epsilon_rel: Perturbation velocity L2 norm relative to the master state.
+            epsilon_abs: Absolute perturbation velocity L2 norm (overrides rel).
             seed: CuPy RNG seed for the initial perturbation.
             is_not_rst: False to resume a previous run at time rtrst.
             rtrst: Relative resume time (multiple of dT_cle and tsave_rst*dt).
@@ -103,7 +107,7 @@ class QGCLE:
         # across N and with the literature)
         self._norm_fac = 1.0 / (m_ref.Nx * m_ref.Ny) ** 2
 
-        base_norm = self._enorm(m_ref.p_hat)
+        base_norm = self._l2norm(m_ref.p_hat)
         if epsilon_abs is not None:
             self.epsilon = float(epsilon_abs)
         else:
@@ -112,10 +116,6 @@ class QGCLE:
             raise ValueError(f"Perturbation norm must be positive, got {self.epsilon}.")
 
         if m_cle is not None:
-            if m_cle.precision != m_ref.precision:
-                raise ValueError(
-                    f"Master and slave precisions differ: {m_ref.precision!r} "
-                    f"vs {m_cle.precision!r}. Build both with the same precision.")
             self.m_cle = m_cle
         else:
             self.m_cle = copy.deepcopy(m_ref)
@@ -130,9 +130,9 @@ class QGCLE:
         delta_psi_hat *= mask
         delta_psi_hat[0, 0] = 0.0
         self.m_ref._enforce_spectral_constraints(delta_psi_hat)
-        norm = self._enorm(delta_psi_hat)
+        norm = self._l2norm(delta_psi_hat)
         if norm <= 0.0:
-            raise RuntimeError("Random perturbation has zero energy norm after masking.")
+            raise RuntimeError("Random perturbation has zero velocity L2 norm after masking.")
         return self._psi_to_q((self.epsilon / norm) * delta_psi_hat)
 
     def _sync_state(self, model):
@@ -156,17 +156,13 @@ class QGCLE:
     def _q_to_psi(self, dq_hat):
         return self.m_ref.inversion * dq_hat
 
-    def _enorm(self, dpsi_hat):
-        """Energy norm of a streamfunction perturbation."""
-        ene_dens = 0.5 * (self.m_ref.kk**2 + self.m_ref.gamma**2) * cp.abs(dpsi_hat)**2
-        ene = self._norm_fac * float(cp.sum(ene_dens, dtype=cp.float64).get())
-        return float(np.sqrt(max(ene, 0.0)))
-
-    def _znorm(self, dq_hat):
-        """Enstrophy norm of a PV perturbation."""
-        ens_dens = 0.5 * cp.abs(dq_hat)**2
-        ens = self._norm_fac * float(cp.sum(ens_dens, dtype=cp.float64).get())
-        return float(np.sqrt(max(ens, 0.0)))
+    def _l2norm(self, dpsi_hat):
+        """Velocity L2 norm, sqrt(<|v|^2>), of a streamfunction perturbation."""
+        l2_dens = self.m_ref.kk**2 * cp.abs(dpsi_hat)**2
+        l2_squared = self._norm_fac * float(
+            cp.sum(l2_dens, dtype=cp.float64).get()
+        )
+        return float(np.sqrt(max(l2_squared, 0.0)))
 
     def _shell_sum(self, dens):
         return npg.aggregate(self._kk_idx_cpu, dens.ravel().get(),
@@ -180,16 +176,16 @@ class QGCLE:
             dq_hat = self._delta_q()
         return self._q_to_psi(dq_hat)
 
-    def _err_budget(self, dpsi_hat, enorm):
+    def _err_budget(self, dpsi_hat, l2norm):
         """Spectra of the normalized error (conditional LLV) and its energy,
         enstrophy and PV-gradient palinstrophy budget terms, linearized about
         the master trajectory (Li et al. 2025b, eqs. 2.27--2.29, adapted to
         the QG PV equation). Sign conventions follow
         get_TENL/get_diagFric/get_diagVisc of turb2d.py."""
         m = self.m_ref
-        # Energy-normalized LLV in streamfunction form; q/rv are derived from it
+        # Velocity-L2-normalized LLV in streamfunction form; q/rv are derived from it
         # only because the QG equation is written for PV.
-        epsi = dpsi_hat / max(enorm, 1e-300)
+        epsi = dpsi_hat / max(l2norm, 1e-300)
         eq = self._psi_to_q(epsi)
         erv = eq + m.gamma**2 * epsi
 
@@ -236,14 +232,268 @@ class QGCLE:
 
         # Integrated budget terms include every Fourier mode; the saved *k
         # arrays remain isotropic spectra on complete radial shells.
-        prod_i = 0.5 * self._norm_fac * float(
+        prod_i = self._norm_fac * float(
             cp.sum(teadv + teprod, dtype=cp.float64).get())
-        diss_i = -0.5 * self._norm_fac * float(
+        diss_i = -self._norm_fac * float(
             cp.sum(tefric + tevisc, dtype=cp.float64).get())
 
         return (evk, zvk, pvk, teadvk, teprodk, tefrick, tevisck,
                 tzadvk, tzprodk, tzfrick, tzvisck,
                 tpadvk, tpprodk, tpvisck, prod_i, diss_i)
+
+    # ---------------- runtime strain/transfer diagnostics ----------------
+    def _transfer_shell_contract(self):
+        """Complete radial shells plus one square-corner residual shell."""
+        cached = getattr(self, "_transfer_shell_cache", None)
+        if cached is not None:
+            return cached
+        m = self.m_ref
+        if m.Nx != m.Ny or m.Nx % 2:
+            raise ValueError("Runtime CLE strain diagnostics require an even square grid.")
+        if not np.isclose(float(m.Lx), float(m.Ly), rtol=0.0, atol=1.0e-12):
+            raise ValueError("Runtime CLE strain diagnostics require Lx=Ly.")
+        n_complete = m.Nx // 2
+        radial_index = cp.rint(
+            cp.sqrt(m.nx2d.astype(cp.float64) ** 2
+                    + m.ny2d.astype(cp.float64) ** 2)
+        ).astype(cp.int32)
+        shell_id = cp.minimum(radial_index, n_complete)
+        n_shells = n_complete + 1
+        dk = 2.0 * np.pi / float(m.Lx)
+        kx_max = float(cp.max(cp.abs(m.kx2d)).get())
+        ky_max = float(cp.max(cp.abs(m.ky2d)).get())
+        corner = float(np.hypot(kx_max, ky_max))
+        cached = {
+            "shell_id": shell_id,
+            "n_complete": n_complete,
+            "n_shells": n_shells,
+            "index": np.arange(n_shells, dtype=np.int32),
+            "k": np.concatenate((
+                np.arange(n_complete, dtype=np.float64) * dk,
+                np.asarray([np.nan]),
+            )),
+            "edge": np.concatenate((
+                np.asarray([0.0]),
+                (np.arange(n_complete, dtype=np.float64) + 0.5) * dk,
+                np.asarray([np.nextafter(corner, np.inf)]),
+            )),
+            "is_outer_residual": np.concatenate((
+                np.zeros(n_complete, dtype=np.int8),
+                np.ones(1, dtype=np.int8),
+            )),
+        }
+        self._transfer_shell_cache = cached
+        return cached
+
+    def _padded_real(self, field_hat):
+        """3/2-padded real fields, consuming the solver pad buffer immediately."""
+        field_hat = cp.asarray(field_hat)
+        if field_hat.ndim == 2:
+            return ifft2(self.m_ref._padding(field_hat)).real
+        flat = field_hat.reshape((-1, self.m_ref.Ny, self.m_ref.Nx))
+        padded = [ifft2(self.m_ref._padding(component)).real for component in flat]
+        return cp.stack(padded, axis=0).reshape(
+            field_hat.shape[:-2] + (self.m_ref.Nypad, self.m_ref.Nxpad)
+        )
+
+    def _unpad_fft(self, padded_field):
+        """FFT a padded real field and return its solver-grid spectrum."""
+        padded_field = cp.asarray(padded_field)
+        if padded_field.ndim == 2:
+            return self.m_ref._unpadding(fft2(padded_field))
+        flat = padded_field.reshape(
+            (-1, self.m_ref.Nypad, self.m_ref.Nxpad)
+        )
+        spectra = [self.m_ref._unpadding(fft2(component)) for component in flat]
+        return cp.stack(spectra, axis=0).reshape(
+            padded_field.shape[:-2] + (self.m_ref.Ny, self.m_ref.Nx)
+        )
+
+    def _transfer_shell_sum(self, modal_values, shell):
+        return cp.bincount(
+            shell["shell_id"].ravel(), weights=modal_values.ravel(),
+            minlength=shell["n_shells"],
+        )[:shell["n_shells"]]
+
+    @staticmethod
+    def _masked_mean(values, valid):
+        count = cp.sum(valid, dtype=cp.float64)
+        total = cp.sum(cp.where(valid, values, 0.0), dtype=cp.float64)
+        return cp.where(count > 0.0, total / count, cp.nan)
+
+    def _compute_transfer_snapshot(self, dpsi_hat, l2norm):
+        """Compute float64 strain, signed production, and shell transfers."""
+        m = self.m_ref
+        shell = self._transfer_shell_contract()
+        shell_id = shell["shell_id"]
+        n_shells = shell["n_shells"]
+
+        psi_hat = m.inversion * m.q_hat
+        llv_hat = dpsi_hat / max(l2norm, 1.0e-300)
+        u_hat = cp.stack((
+            -1j * m.ky2d * psi_hat,
+            1j * m.kx2d * psi_hat,
+        ), axis=0)
+        v_hat = cp.stack((
+            -1j * m.ky2d * llv_hat,
+            1j * m.kx2d * llv_hat,
+        ), axis=0)
+        strain_hat = cp.stack((
+            m.kx2d * m.ky2d * psi_hat,
+            0.5 * (m.ky2d**2 - m.kx2d**2) * psi_hat,
+        ), axis=0)
+        omega_hat = 0.5 * m.kk**2 * psi_hat
+        grad_v_hat = cp.stack((
+            1j * m.kx2d * v_hat[0],
+            1j * m.ky2d * v_hat[0],
+            1j * m.kx2d * v_hat[1],
+            1j * m.ky2d * v_hat[1],
+        ), axis=0)
+
+        velocity = cp.stack((
+            ifft2(v_hat[0]).real,
+            ifft2(v_hat[1]).real,
+        ), axis=0)
+        strain = cp.stack((
+            ifft2(strain_hat[0]).real,
+            ifft2(strain_hat[1]).real,
+        ), axis=0)
+        vx, vy = velocity[0], velocity[1]
+        s11, s12 = strain[0], strain[1]
+        velocity_pad = self._padded_real(v_hat)
+        strain_pad = self._padded_real(strain_hat)
+        grad_v_pad = self._padded_real(grad_v_hat)
+        vpx, vpy = velocity_pad[0], velocity_pad[1]
+        speed2_pad = vpx * vpx + vpy * vpy
+        denominator = cp.mean(speed2_pad)
+        if float(denominator.get()) <= 0.0:
+            raise ValueError("Runtime CLE transfer diagnostic has zero velocity norm.")
+        total_strain = cp.hypot(strain_pad[0], strain_pad[1])
+        total_vsv = (
+            strain_pad[0] * (vpx * vpx - vpy * vpy)
+            + 2.0 * strain_pad[1] * vpx * vpy
+        )
+        p_fields = -cp.mean(total_vsv) / denominator
+        p_plus = 0.5 * cp.mean(
+            total_strain * speed2_pad - total_vsv
+        ) / denominator
+        p_minus = 0.5 * cp.mean(
+            total_strain * speed2_pad + total_vsv
+        ) / denominator
+
+        alignment_denominator = total_strain * speed2_pad
+        alignment_floor = (
+            ALIGNMENT_RELATIVE_FLOOR * cp.max(alignment_denominator)
+        )
+        alignment_valid = alignment_denominator > alignment_floor
+        chi_total_mean = self._masked_mean(
+            -total_vsv / cp.maximum(alignment_denominator, 1.0e-300),
+            alignment_valid,
+        )
+
+        spectral_l2 = cp.sum(
+            cp.abs(v_hat[0])**2 + cp.abs(v_hat[1])**2,
+            dtype=cp.float64,
+        )
+        p_strain_matrix = cp.empty(
+            (n_shells, n_shells), dtype=cp.float64
+        )
+        p_velocity_matrix = cp.empty_like(p_strain_matrix)
+        chi_source_mean = cp.empty(n_shells, dtype=cp.float64)
+        chi_source_additive_mean = cp.empty(n_shells, dtype=cp.float64)
+
+        for source_index in range(n_shells):
+            source_mask = shell_id == source_index
+            u_hat_m = cp.where(source_mask[None, :, :], u_hat, 0.0)
+            strain_hat_m = cp.where(
+                source_mask[None, :, :], strain_hat, 0.0
+            )
+            omega_hat_m = cp.where(source_mask, omega_hat, 0.0)
+
+            u_m_pad = self._padded_real(u_hat_m)
+            strain_m_pad = self._padded_real(strain_hat_m)
+            omega_m_pad = self._padded_real(omega_hat_m)
+            sm11, sm12 = strain_m_pad[0], strain_m_pad[1]
+
+            strain_x = sm11 * vpx + sm12 * vpy
+            strain_y = sm12 * vpx - sm11 * vpy
+            rotation_x = omega_m_pad * vpy
+            rotation_y = -omega_m_pad * vpx
+            advection_x = (
+                u_m_pad[0] * grad_v_pad[0]
+                + u_m_pad[1] * grad_v_pad[1]
+            )
+            advection_y = (
+                u_m_pad[0] * grad_v_pad[2]
+                + u_m_pad[1] * grad_v_pad[3]
+            )
+            full_x = strain_x + rotation_x + advection_x
+            full_y = strain_y + rotation_y + advection_y
+
+            local_strain_work = -(vpx * strain_x + vpy * strain_y)
+            strain_action_hat = self._unpad_fft(
+                cp.stack((strain_x, strain_y), axis=0)
+            )
+            full_action_hat = self._unpad_fft(
+                cp.stack((full_x, full_y), axis=0)
+            )
+            strain_modal = -cp.real(
+                cp.conj(v_hat[0]) * strain_action_hat[0]
+                + cp.conj(v_hat[1]) * strain_action_hat[1]
+            )
+            velocity_modal = -cp.real(
+                cp.conj(v_hat[0]) * full_action_hat[0]
+                + cp.conj(v_hat[1]) * full_action_hat[1]
+            )
+            p_strain_matrix[source_index] = self._transfer_shell_sum(
+                strain_modal, shell
+            ) / spectral_l2
+            p_velocity_matrix[source_index] = self._transfer_shell_sum(
+                velocity_modal, shell
+            ) / spectral_l2
+
+            source_strain = cp.hypot(sm11, sm12)
+            independent_denominator = source_strain * speed2_pad
+            independent_floor = (
+                ALIGNMENT_RELATIVE_FLOOR * cp.max(independent_denominator)
+            )
+            independent_valid = independent_denominator > independent_floor
+            independent_chi = local_strain_work / cp.maximum(
+                independent_denominator, 1.0e-300
+            )
+            chi_source_mean[source_index] = self._masked_mean(
+                independent_chi, independent_valid
+            )
+            additive_chi = local_strain_work / cp.maximum(
+                alignment_denominator, 1.0e-300
+            )
+            chi_source_additive_mean[source_index] = self._masked_mean(
+                additive_chi, alignment_valid
+            )
+
+        p_strain_receiver = cp.sum(p_strain_matrix, axis=0)
+        p_velocity_receiver = cp.sum(p_velocity_matrix, axis=0)
+        velocity_receiver_cpu = cp.asnumpy(p_velocity_receiver)
+
+        result = {
+            "S11": cp.asnumpy(s11),
+            "S12": cp.asnumpy(s12),
+            "vx": cp.asnumpy(vx),
+            "vy": cp.asnumpy(vy),
+            "P_strain_source_receiver": cp.asnumpy(p_strain_matrix),
+            "P_strain_receiver": cp.asnumpy(p_strain_receiver),
+            "P_velocity_source_receiver": cp.asnumpy(p_velocity_matrix),
+            "P_velocity_receiver": velocity_receiver_cpu,
+            "chi_strain_source_mean": cp.asnumpy(chi_source_mean),
+            "chi_strain_source_additive_mean": cp.asnumpy(
+                chi_source_additive_mean
+            ),
+            "chi_total_mean": float(chi_total_mean.item()),
+            "P_fields": float(p_fields.item()),
+            "P_plus": float(p_plus.item()),
+            "P_minus": float(p_minus.item()),
+        }
+        return result
 
     def _herm_project(self, d_hat):
         """Project a spectral difference onto the Hermitian (real-field)
@@ -276,15 +526,12 @@ class QGCLE:
         self.d_times = self.dds.variables['time']
         self.lami_var = self.dds.variables['lam_i']
         self.lam_var = self.dds.variables['lam']
-        self.enorm_var = self.dds.variables['enorm']
-        self.lamiz_var = self.dds.variables['lam_i_z']
-        self.lamz_var = self.dds.variables['lam_z']
-        self.znorm_var = self.dds.variables['znorm']
+        self.l2norm_var = self.dds.variables['l2norm']
         self.evk_var = self.dds.variables['evk']
         self.zvk_var = self.dds.variables['zvk']
         self.pvk_var = self._bind_diag_var(
-            'pvk', 'f4', ('time', 'k'),
-            'energy-normalized LLV PV-gradient palinstrophy spectrum; '
+            'pvk', 'f8', ('time', 'k'),
+            'velocity-L2-normalized LLV PV-gradient palinstrophy spectrum; '
             'modal density 0.5*k_mode^2*|eq|^2 is weighted before the '
             'complete-radial-shell sum')
         self.teadvk_var = self.dds.variables['teadvk']
@@ -296,29 +543,29 @@ class QGCLE:
         self.tzfrick_var = self.dds.variables['tzfrick']
         self.tzvisck_var = self.dds.variables['tzvisck']
         self.tpadvk_var = self._bind_diag_var(
-            'tpadvk', 'f4', ('time', 'k'),
-            'signed advective tendency of energy-normalized LLV '
+            'tpadvk', 'f8', ('time', 'k'),
+            'signed advective tendency of velocity-L2-normalized LLV '
             'PV-gradient palinstrophy, '
             '-k_mode^2*Re[conj(eq)*J(psi_ref,eq)], weighted before the '
             'complete-radial-shell sum')
         self.tpprodk_var = self._bind_diag_var(
-            'tpprodk', 'f4', ('time', 'k'),
-            'signed production tendency of energy-normalized LLV '
+            'tpprodk', 'f8', ('time', 'k'),
+            'signed production tendency of velocity-L2-normalized LLV '
             'PV-gradient palinstrophy, '
             '-k_mode^2*Re[conj(eq)*J(epsi,q_ref)], weighted before the '
             'complete-radial-shell sum')
         self.tpvisck_var = self._bind_diag_var(
-            'tpvisck', 'f4', ('time', 'k'),
-            'signed hyperviscous tendency of energy-normalized LLV '
+            'tpvisck', 'f8', ('time', 'k'),
+            'signed hyperviscous tendency of velocity-L2-normalized LLV '
             'PV-gradient palinstrophy, '
             'k_mode^2*Re[conj(eq)*(hylap*erv)], weighted before the '
             'complete-radial-shell sum')
         self.tprodk_var = self._bind_diag_var(
-            'tprodk', 'f4', ('time', 'k'),
+            'tprodk', 'f8', ('time', 'k'),
             'Li-style combined production spectrum teadvk + teprodk '
             'on complete radial shells k < N/2')
         self.tdissk_var = self._bind_diag_var(
-            'tdissk', 'f4', ('time', 'k'),
+            'tdissk', 'f8', ('time', 'k'),
             'combined energy dissipation tendency tefrick + tevisck '
             'on complete radial shells k < N/2')
         self.prodi_var = self._bind_diag_var(
@@ -358,11 +605,15 @@ class QGCLE:
         ds.Ny = int(m.Ny)
         ds.Lx = float(m.Lx)
         ds.Ly = float(m.Ly)
+        ds.precision = "double"
+        ds.rescale_norm = "velocity_l2"
+        ds.velocity_l2_target = 1.0
+        ds.perturbation_energy_target = 0.5
         ds.normalization = (
-            'llv = delta_psi/||delta||_E, with ||delta||_E^2 = '
-            '(Nx*Ny)^-2 sum_modes 0.5*(k^2+gamma^2)*|delta_psi_hat|^2; '
-            'spectral arrays are (Nx*Ny)^-2 sums of their stated modal '
-            'densities and all E/Z/P arrays use this energy-normalized llv'
+            'llv = delta_psi/||delta||_2, with ||delta||_2^2 = '
+            '(Nx*Ny)^-2 sum_modes k^2*|delta_psi_hat|^2 = <|v|^2> = 1; '
+            'the full perturbation energy is 1/2; spectral arrays are '
+            '(Nx*Ny)^-2 sums of their stated modal densities'
         )
         ds.shell_convention = (
             'rounded radial grid-index shells; k = shell_index*(2*pi/Lx); '
@@ -388,25 +639,22 @@ class QGCLE:
             self.dds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
             self.dds.createDimension('time', None)
             self.dds.createDimension('k', len(self.m_ref.kk_iso))
-            kk = self.dds.createVariable('k', 'f4', ('k',))
+            kk = self.dds.createVariable('k', 'f8', ('k',))
             kk[:] = self.m_ref.kk_iso.get()
             self.d_times = self.dds.createVariable('time', 'f8', ('time',))
             self.lami_var = self.dds.createVariable('lam_i', 'f8', ('time',))
             self.lam_var = self.dds.createVariable('lam', 'f8', ('time',))
-            self.enorm_var = self.dds.createVariable('enorm', 'f8', ('time',))
-            self.lamiz_var = self.dds.createVariable('lam_i_z', 'f8', ('time',))
-            self.lamz_var = self.dds.createVariable('lam_z', 'f8', ('time',))
-            self.znorm_var = self.dds.createVariable('znorm', 'f8', ('time',))
-            self.evk_var = self.dds.createVariable('evk', 'f4', ('time', 'k'))
-            self.zvk_var = self.dds.createVariable('zvk', 'f4', ('time', 'k'))
-            self.teadvk_var = self.dds.createVariable('teadvk', 'f4', ('time', 'k'))
-            self.teprodk_var = self.dds.createVariable('teprodk', 'f4', ('time', 'k'))
-            self.tefrick_var = self.dds.createVariable('tefrick', 'f4', ('time', 'k'))
-            self.tevisck_var = self.dds.createVariable('tevisck', 'f4', ('time', 'k'))
-            self.tzadvk_var = self.dds.createVariable('tzadvk', 'f4', ('time', 'k'))
-            self.tzprodk_var = self.dds.createVariable('tzprodk', 'f4', ('time', 'k'))
-            self.tzfrick_var = self.dds.createVariable('tzfrick', 'f4', ('time', 'k'))
-            self.tzvisck_var = self.dds.createVariable('tzvisck', 'f4', ('time', 'k'))
+            self.l2norm_var = self.dds.createVariable('l2norm', 'f8', ('time',))
+            self.evk_var = self.dds.createVariable('evk', 'f8', ('time', 'k'))
+            self.zvk_var = self.dds.createVariable('zvk', 'f8', ('time', 'k'))
+            self.teadvk_var = self.dds.createVariable('teadvk', 'f8', ('time', 'k'))
+            self.teprodk_var = self.dds.createVariable('teprodk', 'f8', ('time', 'k'))
+            self.tefrick_var = self.dds.createVariable('tefrick', 'f8', ('time', 'k'))
+            self.tevisck_var = self.dds.createVariable('tevisck', 'f8', ('time', 'k'))
+            self.tzadvk_var = self.dds.createVariable('tzadvk', 'f8', ('time', 'k'))
+            self.tzprodk_var = self.dds.createVariable('tzprodk', 'f8', ('time', 'k'))
+            self.tzfrick_var = self.dds.createVariable('tzfrick', 'f8', ('time', 'k'))
+            self.tzvisck_var = self.dds.createVariable('tzvisck', 'f8', ('time', 'k'))
             self._bind_diag_vars()
             self.dds.description = "QG CLE/conditional-LLV diagnostics (master-slave, rescaled)"
             self.dds.precision = self.m_ref.precision
@@ -414,7 +662,7 @@ class QGCLE:
             self.dds.dTobs = self.dTobs
             self.dds.dT_cle = self.dT
             self.dds.epsilon = self.epsilon
-            self.dds.rescale_norm = "energy"
+            self.dds.rescale_norm = "velocity_l2"
             self.dds.seed = self.seed
             self.dds.dt = self.dt
             self.dds.file_index = nf
@@ -426,8 +674,6 @@ class QGCLE:
     def _init_lam_sums(self, n_diag_done, nsave, prefix='cle_d'):
         self._lam_sum = 0.0
         self._lam_n = 0
-        self._lamz_sum = 0.0
-        self._lamz_n = 0
         self._prod_sum = 0.0
         self._diss_sum = 0.0
         self._lbudget_sum = 0.0
@@ -447,27 +693,24 @@ class QGCLE:
                 if n_take <= 0:
                     break
                 prev = np.asarray(ds.variables['lam_i'][:n_take], dtype=np.float64)
-                prev_z = np.asarray(ds.variables['lam_i_z'][:n_take], dtype=np.float64)
                 if 'prod_i' in ds.variables and 'diss_i' in ds.variables:
                     prev_prod = np.asarray(ds.variables['prod_i'][:n_take], dtype=np.float64)
                     prev_diss = np.asarray(ds.variables['diss_i'][:n_take], dtype=np.float64)
                 elif 'tprodk' in ds.variables and 'tdissk' in ds.variables:
-                    prev_prod = 0.5 * np.nansum(ds.variables['tprodk'][:n_take], axis=1)
-                    prev_diss = -0.5 * np.nansum(ds.variables['tdissk'][:n_take], axis=1)
+                    prev_prod = np.nansum(ds.variables['tprodk'][:n_take], axis=1)
+                    prev_diss = -np.nansum(ds.variables['tdissk'][:n_take], axis=1)
                 else:
                     prev_prod = np.full(n_take, np.nan)
                     prev_diss = np.full(n_take, np.nan)
             self._lam_sum += float(np.nansum(prev))
             self._lam_n += int(np.isfinite(prev).sum())
-            self._lamz_sum += float(np.nansum(prev_z))
-            self._lamz_n += int(np.isfinite(prev_z).sum())
             self._prod_sum += float(np.nansum(prev_prod))
             self._diss_sum += float(np.nansum(prev_diss))
             self._lbudget_sum += float(np.nansum(prev_prod - prev_diss))
             remaining -= n_take
             nf += 1
 
-    def save_diag(self, it, t_abs, lam_i, enorm, lam_i_z, znorm, budget):
+    def save_diag(self, it, t_abs, lam_i, l2norm, budget):
         (evk, zvk, pvk, teadvk, teprodk, tefrick, tevisck,
          tzadvk, tzprodk, tzfrick, tzvisck,
          tpadvk, tpprodk, tpvisck, prod_i, diss_i) = budget
@@ -480,12 +723,7 @@ class QGCLE:
         self._lam_n += 1
         running_lam = self._lam_sum / self._lam_n
         self.lam_var[it] = running_lam
-        self.enorm_var[it] = enorm
-        self.lamiz_var[it] = lam_i_z
-        self._lamz_sum += lam_i_z
-        self._lamz_n += 1
-        self.lamz_var[it] = self._lamz_sum / self._lamz_n
-        self.znorm_var[it] = znorm
+        self.l2norm_var[it] = l2norm
         self.evk_var[it, :] = evk
         self.zvk_var[it, :] = zvk
         self.pvk_var[it, :] = pvk
@@ -516,16 +754,191 @@ class QGCLE:
         self.lbudget_resid_var[it] = running_lam - running_lbudget
         self.dds.sync()
 
+    def _bind_transfer_vars(self):
+        ds = self.svp_ds
+        names = (
+            "time", "elapsed_time", "source_record",
+            "S11", "S12", "vx", "vy",
+            "P_strain_source_receiver", "P_strain_receiver",
+            "P_velocity_source_receiver", "P_velocity_receiver",
+            "chi_strain_source_mean", "chi_strain_source_additive_mean",
+            "chi_total_mean", "P_fields", "P_plus", "P_minus",
+        )
+        missing = [name for name in names if name not in ds.variables]
+        if missing:
+            raise KeyError(f"Runtime CLE transfer file is missing {missing}.")
+        self._svp_vars = {name: ds.variables[name] for name in names}
+
+    def _create_transfer_nc(self, nf):
+        shell = self._transfer_shell_contract()
+        output_dir = os.path.join(self.savedir, TRANSFER_SUBDIR)
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"cle_svp_{nf:04d}.nc")
+        append = os.path.exists(path) and not self.is_not_rst
+        if append:
+            self.svp_ds = nc.Dataset(path, "a", format="NETCDF4")
+            if getattr(self.svp_ds, "transfer_revision", "") != TRANSFER_REVISION:
+                self.svp_ds.close()
+                self.svp_ds = None
+                raise ValueError(
+                    f"{path}: incompatible runtime CLE transfer revision."
+                )
+            self.svp_ds.complete = 0
+            self._bind_transfer_vars()
+            return
+
+        ds = nc.Dataset(path, "w", format="NETCDF4")
+        self.svp_ds = ds
+        ds.createDimension("time", None)
+        ds.createDimension("y", self.m_ref.Ny)
+        ds.createDimension("x", self.m_ref.Nx)
+        ds.createDimension("source_shell", shell["n_shells"])
+        ds.createDimension("receiver_shell", shell["n_shells"])
+        ds.createDimension("shell_edge", shell["n_shells"] + 1)
+
+        ds.createVariable("time", "f8", ("time",))
+        ds.createVariable("elapsed_time", "f8", ("time",))
+        ds.createVariable("source_record", "i4", ("time",))
+        ds.createVariable("x", "f8", ("x",))[:] = self.m_ref.x.get()
+        ds.createVariable("y", "f8", ("y",))[:] = self.m_ref.y.get()
+        ds.createVariable("shell_edge", "f8", ("shell_edge",))[:] = shell["edge"]
+        for prefix in ("source", "receiver"):
+            dimension = f"{prefix}_shell"
+            ds.createVariable(
+                f"{prefix}_shell_index", "i4", (dimension,)
+            )[:] = shell["index"]
+            ds.createVariable(
+                f"{prefix}_shell_k", "f8", (dimension,), fill_value=np.nan
+            )[:] = shell["k"]
+            ds.createVariable(
+                f"{prefix}_shell_is_outer_residual", "i1", (dimension,)
+            )[:] = shell["is_outer_residual"]
+
+        chunks = (1, min(256, self.m_ref.Ny), min(256, self.m_ref.Nx))
+        for name in ("S11", "S12", "vx", "vy"):
+            ds.createVariable(
+                name, "f8", ("time", "y", "x"), zlib=True,
+                complevel=2, chunksizes=chunks,
+            )
+        ds.createVariable(
+            "P_strain_source_receiver", "f8",
+            ("time", "source_shell", "receiver_shell"),
+            zlib=True, complevel=1,
+        )
+        ds.createVariable(
+            "P_strain_receiver", "f8", ("time", "receiver_shell"),
+            zlib=True, complevel=1,
+        )
+        ds.createVariable(
+            "P_velocity_source_receiver", "f8",
+            ("time", "source_shell", "receiver_shell"),
+            zlib=True, complevel=1,
+        )
+        ds.createVariable(
+            "P_velocity_receiver", "f8", ("time", "receiver_shell"),
+            zlib=True, complevel=1,
+        )
+        ds.createVariable(
+            "chi_strain_source_mean", "f8", ("time", "source_shell"),
+            zlib=True, complevel=1, fill_value=np.nan,
+        )
+        ds.createVariable(
+            "chi_strain_source_additive_mean", "f8",
+            ("time", "source_shell"), zlib=True, complevel=1,
+            fill_value=np.nan,
+        )
+        scalar_names = (
+            "chi_total_mean", "P_fields", "P_plus", "P_minus",
+        )
+        for name in scalar_names:
+            ds.createVariable(name, "f8", ("time",), fill_value=np.nan)
+
+        ds.description = (
+            "Runtime float64 CLE strain, signed-production, source-receiver, "
+            "and alignment diagnostics"
+        )
+        ds.algorithm_revision = TRANSFER_REVISION
+        ds.transfer_revision = TRANSFER_REVISION
+        ds.complete = 0
+        ds.precision = "double"
+        ds.fft_calculation_dtype = "float64/complex128"
+        ds.field_storage_dtype = "f8"
+        ds.rescale_norm = "velocity_l2"
+        ds.velocity_l2_target = 1.0
+        ds.perturbation_energy_target = 0.5
+        ds.elapsed_start = TRANSFER_ELAPSED_START
+        ds.elapsed_stop = TRANSFER_ELAPSED_STOP
+        ds.complete_shell_count = shell["n_complete"]
+        ds.outer_residual_shell_index = shell["n_complete"]
+        ds.receiver_matrix_enabled = 1
+        ds.Nobs = int(self.Nobs)
+        ds.Nx = int(self.m_ref.Nx)
+        ds.Ny = int(self.m_ref.Ny)
+        ds.Lx = float(self.m_ref.Lx)
+        ds.Ly = float(self.m_ref.Ly)
+        ds.kf = float(self.m_ref.fscale)
+        ds.shell_convention = (
+            "indices 0,...,N/2-1 match cle_d rounded radial shells; "
+            "index N/2 is the square-corner outer residual"
+        )
+        ds.normalization = (
+            "llv velocity L2 norm: <|v|^2>=1 and perturbation energy=1/2; "
+            "production matrices divide by <|v|^2>"
+        )
+        ds.dealiasing = "solver 3/2-rule padding and unpadding"
+        ds.alignment_relative_floor = ALIGNMENT_RELATIVE_FLOOR
+        ds.file_index = int(nf)
+        self._bind_transfer_vars()
+
+    def _save_transfer_var(self, it, t_abs, elapsed_time, result):
+        if getattr(self, "svp_ds", None) is None:
+            self._create_transfer_nc(self._snapshot_file_index)
+        values = self._svp_vars
+        values["time"][it] = t_abs
+        values["elapsed_time"][it] = elapsed_time
+        values["source_record"][it] = it
+        for name in ("S11", "S12", "vx", "vy"):
+            values[name][it, :, :] = result[name]
+        values["P_strain_source_receiver"][it, :, :] = (
+            result["P_strain_source_receiver"]
+        )
+        values["P_strain_receiver"][it, :] = result["P_strain_receiver"]
+        values["P_velocity_source_receiver"][it, :, :] = (
+            result["P_velocity_source_receiver"]
+        )
+        values["P_velocity_receiver"][it, :] = result["P_velocity_receiver"]
+        values["chi_strain_source_mean"][it, :] = (
+            result["chi_strain_source_mean"]
+        )
+        values["chi_strain_source_additive_mean"][it, :] = (
+            result["chi_strain_source_additive_mean"]
+        )
+        scalar_names = (
+            "chi_total_mean", "P_fields", "P_plus", "P_minus",
+        )
+        for name in scalar_names:
+            values[name][it] = result[name]
+        self.svp_ds.sync()
+
+    def _close_transfer_nc(self):
+        if getattr(self, "svp_ds", None) is not None:
+            self.svp_ds.complete = 1
+            self.svp_ds.sync()
+            self.svp_ds.close()
+            self.svp_ds = None
+            self._svp_vars = None
+
     def _bind_snapshot_var(self, name, description):
         if name in self.ds.variables:
             var = self.ds.variables[name]
         else:
-            var = self.ds.createVariable(name, 'f4', ('time', 'y', 'x'), zlib=False)
+            var = self.ds.createVariable(name, 'f8', ('time', 'y', 'x'), zlib=False)
         var.description = description
         return var
 
     def create_nc(self, nf, prefix='cle_o'):
         """Snapshot file with master q, raw perturbations, and normalized LLV."""
+        self._snapshot_file_index = int(nf)
         nc_filename = os.path.join(self.savedir, "%s_%04d.nc" % (prefix, nf))
         if os.path.exists(nc_filename) and not self.is_not_rst:
             self.ds = nc.Dataset(nc_filename, 'a', format='NETCDF4')
@@ -539,21 +952,21 @@ class QGCLE:
             self.ds.createDimension('time', None)
             self.ds.createDimension('x', self.m_ref.Nx)
             self.ds.createDimension('y', self.m_ref.Ny)
-            self.times = self.ds.createVariable('time', 'f4', ('time',))
-            xs = self.ds.createVariable('x', 'f4', ('x',))
-            ys = self.ds.createVariable('y', 'f4', ('y',))
+            self.times = self.ds.createVariable('time', 'f8', ('time',))
+            xs = self.ds.createVariable('x', 'f8', ('x',))
+            ys = self.ds.createVariable('y', 'f8', ('y',))
             xs[:] = self.m_ref.x.get()
             ys[:] = self.m_ref.y.get()
-            self.q_var = self.ds.createVariable('q', 'f4', ('time', 'y', 'x'), zlib=False)
-            self.llv_var = self.ds.createVariable('llv', 'f4', ('time', 'y', 'x'), zlib=False)
+            self.q_var = self.ds.createVariable('q', 'f8', ('time', 'y', 'x'), zlib=False)
+            self.llv_var = self.ds.createVariable('llv', 'f8', ('time', 'y', 'x'), zlib=False)
             self.delta_psi_var = self._bind_snapshot_var('delta_psi', 'raw delta_psi')
             self.delta_q_var = self._bind_snapshot_var('delta_q', 'raw delta_q')
             self.ds.description = "QG CLE run snapshots"
             self.ds.Nobs = self.Nobs
             self.ds.dT_cle = self.dT
             self.ds.epsilon = self.epsilon
-            self.ds.rescale_norm = "energy"
-            self.ds.llv_description = "delta_psi normalized by the energy norm"
+            self.ds.rescale_norm = "velocity_l2"
+            self.ds.llv_description = "delta_psi normalized by the velocity L2 norm"
         self._stamp_output_metadata(self.ds)
 
     def save_var(self, it):
@@ -561,12 +974,12 @@ class QGCLE:
         self.q_var[it, :, :] = ifft2(self.m_ref.q_hat).real.get()
         dq = self._delta_q()
         dpsi = self._delta_psi(dq)
-        enorm = self._enorm(dpsi)
+        l2norm = self._l2norm(dpsi)
         dpsi_r = ifft2(dpsi).real
         dq_r = ifft2(dq).real
         self.delta_psi_var[it, :, :] = dpsi_r.get()
         self.delta_q_var[it, :, :] = dq_r.get()
-        self.llv_var[it, :, :] = (dpsi_r / max(enorm, 1e-30)).get()
+        self.llv_var[it, :, :] = (dpsi_r / max(l2norm, 1e-30)).get()
         self.ds.sync()
 
     def create_rst(self, nf):
@@ -587,7 +1000,7 @@ class QGCLE:
         ds.cle_dTobs = float(self.dTobs)
         ds.cle_dT_cle = float(self.dT)
         ds.cle_epsilon = float(self.epsilon)
-        ds.cle_rescale_norm = "energy"
+        ds.cle_rescale_norm = "velocity_l2"
         ds.cle_dt = float(self.dt)
         ds.cle_Nx = int(self.m_ref.Nx)
         ds.cle_Ny = int(self.m_ref.Ny)
@@ -599,6 +1012,7 @@ class QGCLE:
         self.m_cle.save_rst(it)
 
     def close_nc(self):
+        self._close_transfer_nc()
         self.ds.close()
 
     def close_diag(self):
@@ -629,13 +1043,19 @@ class QGCLE:
         if tsave_rst % self.intvl != 0:
             raise ValueError("tsave_rst must be a multiple of the rescaling interval "
                              f"({self.intvl} steps) so restarts align with rescales.")
+        if tsave % self.intvl != 0:
+            raise ValueError("tsave must be a multiple of the rescaling interval "
+                             f"({self.intvl} steps) for runtime transfer diagnostics.")
+        self.svp_ds = None
+        self._svp_vars = None
+        self._pending_transfer = None
 
         total_steps = int(round(tmax / self.dt))
         nrst = nsave
         ndiag = max(1, int(round((tsave * nsave) / self.intvl)))
         print(f"Starting CLE run. Nobs={self.Nobs}, dTobs={self.dTobs}, "
               f"dT_cle={self.dT}, epsilon={self.epsilon:.6e}, "
-              f"rescale_norm=energy, tmax={tmax}")
+              f"rescale_norm=velocity_l2, tmax={tmax}")
 
         if self.is_not_rst:
             nf0 = nfrst0 = nfdiag0 = itsave = itrst = itdiag = 0
@@ -690,8 +1110,7 @@ class QGCLE:
         # Norms of the current rescaled error; references for the next interval.
         dq0 = self._delta_q()
         dpsi0 = self._delta_psi(dq0)
-        self._enorm_prev = self._enorm(dpsi0)
-        self._znorm_prev = self._znorm(dq0)
+        self._l2norm_prev = self._l2norm(dpsi0)
 
         # Same clock convention as cda_turb2d.py: rt is CLE-relative runtime;
         # model.t is absolute time from the spinup pickup point.
@@ -712,20 +1131,30 @@ class QGCLE:
             if n % 10000 == 0:
                 E_r = self.m_ref.get_Etot(self.m_ref.p_hat) / self.m_ref.Nx / self.m_ref.Ny
                 lam_e = self._lam_sum / self._lam_n if self._lam_n else float('nan')
-                lam_z = self._lamz_sum / self._lamz_n if self._lamz_n else float('nan')
                 print(f"Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}      "
                       f"step {n:7d}      t={self.m_ref.t:9.6f}s      E_ref={E_r:.4e}      "
-                      f"lam={lam_e:.4e}      lam_z={lam_z:.4e}")
+                      f"lam={lam_e:.4e}")
 
             # measure and rescale at the end of each dT_cle interval
             if n > n_start and n % self.intvl == 0:
                 dq = self._delta_q()
                 dpsi = self._delta_psi(dq)
-                znorm = self._znorm(dq)
-                enorm = self._enorm(dpsi)
-                lam_i = np.log(enorm / max(self._enorm_prev, 1e-300)) / self.dT
-                lam_i_z = np.log(znorm / max(self._znorm_prev, 1e-300)) / self.dT
-                budget = self._err_budget(dpsi, enorm)
+                l2norm = self._l2norm(dpsi)
+                lam_i = np.log(l2norm / max(self._l2norm_prev, 1e-300)) / self.dT
+                budget = self._err_budget(dpsi, l2norm)
+                transfer_enabled = (
+                    n % tsave == 0
+                    and TRANSFER_ELAPSED_START - 1.0e-10 <= self.rt
+                    <= TRANSFER_ELAPSED_STOP + 1.0e-10
+                )
+                if transfer_enabled:
+                    transfer_started = time.monotonic()
+                    self._pending_transfer = self._compute_transfer_snapshot(
+                        dpsi, l2norm
+                    )
+                    self._pending_transfer_seconds = (
+                        time.monotonic() - transfer_started
+                    )
                 if indiag == ndiag:
                     itdiag = 0
                     if nfdiag > nfdiag0:
@@ -733,14 +1162,13 @@ class QGCLE:
                     self.create_diag_nc(nfdiag)
                     indiag = 0
                     nfdiag += 1
-                self.save_diag(itdiag, float(self.m_ref.t), lam_i, enorm, lam_i_z, znorm, budget)
+                self.save_diag(itdiag, float(self.m_ref.t), lam_i, l2norm, budget)
                 itdiag += 1
                 indiag += 1
-                fac = self.epsilon / max(enorm, 1e-300)
+                fac = self.epsilon / max(l2norm, 1e-300)
                 self._rescale(fac)
-                # Rescaling is uniform, so both norms scale by the same factor.
-                self._enorm_prev = enorm * fac
-                self._znorm_prev = znorm * fac
+                # Rescaling is uniform in the velocity-L2 norm.
+                self._l2norm_prev = l2norm * fac
 
             if n % tsave == 0:
                 if insave == nsave:
@@ -751,6 +1179,17 @@ class QGCLE:
                     insave = 0
                     nf += 1
                 self.save_var(itsave)
+                if self._pending_transfer is not None:
+                    self._save_transfer_var(
+                        itsave, float(self.m_ref.t), float(self.rt),
+                        self._pending_transfer,
+                    )
+                    print(
+                        f"[save_transfer] step {n:7d} t={self.m_ref.t:9.6f} "
+                        f"elapsed={self.rt:.1f} "
+                        f"seconds={self._pending_transfer_seconds:.2f}"
+                    )
+                    self._pending_transfer = None
                 print(f"[save_var] Local time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}   "
                       f"step {n:7d}  t={self.m_ref.t:9.6f}s ")
                 itsave += 1
