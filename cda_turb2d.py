@@ -60,6 +60,20 @@ class QGCDA:
         self._init_grid()
         self.is_not_rst = is_not_rst
         self.rtrst = rtrst
+        self._reference_forcing = self.m_ref.forcing_norm in ('energy', 'enstrophy', 'kinetic_energy')
+        if self._reference_forcing:
+            for model in (self.m_cda, self.m if self.is_ctrl else None,
+                          self.m_gnud if self.is_gnuding else None):
+                if model is None:
+                    continue
+                if any(getattr(model, key) != getattr(self.m_ref, key)
+                       for key in ('Nx', 'Ny', 'Lx', 'Ly', 'dt', 'trst')):
+                    raise ValueError('Reference-normalized forcing requires matching grids, '
+                                     'domains, time steps, and pickup times.')
+                # Use the existing external-forcing mode without renormalizing.
+                model.forcing = None
+                model.forcing_norm = None
+                model.force_q = self.m_ref.force_q.copy()
 
     def _init_grid(self):
         """Initialize observation grid and coordinate mappings"""
@@ -108,7 +122,7 @@ class QGCDA:
         """Convert a spectral observation field on the model grid into q-space."""
         if self.obs_field == 'q':
             return obs_hat
-        return (self.m_cda.lap - self.m_cda.gamma**2) * obs_hat
+        return self.m_cda._q_from_psi(obs_hat)
 
     def _obs_to_q_hat(self, obs_field):
         """Map an observation-space field on the model grid into q-space."""
@@ -215,11 +229,8 @@ class QGCDA:
             self.Ih_ref_q_hat = self._obs_hat_to_q_hat(self.Ih_ref_obs_hat)
             self.m_cda.q_hat = self._obs_hat_to_q_hat(self.Ih_ot_obs_hat)
             self.m_cda.p_hat = self.m_cda.inversion * self.m_cda.q_hat
-            if self.m_cda.gamma:
-                self.m_cda.rv_hat = (self.m_cda.q_hat
-                                     + self.m_cda.gamma**2 * self.m_cda.p_hat)
-            else:
-                self.m_cda.rv_hat = self.m_cda.q_hat
+            self.m_cda.rv_hat = self.m_cda._relative_vorticity(
+                self.m_cda.p_hat, self.m_cda.q_hat)
             self.m_cda.da_term[...] = 0.0
             self.cda_forcing = self.m_cda.da_term
         else:
@@ -323,15 +334,16 @@ class QGCDA:
         ek_model = np.asarray(model.get_Ek(model.p_hat))
         ek_ref = np.asarray(model.get_Ek(p_ref_hat))
         dek = np.asarray(model.get_Ek(model.p_hat - p_ref_hat))
-        zk_model = np.asarray(model.get_Zk(model.q_hat))
-        zk_ref = np.asarray(model.get_Zk(q_ref_hat))
-        dzk = np.asarray(model.get_Zk(model.q_hat - q_ref_hat))
+        zk_model = np.asarray(model.get_Qk(model.q_hat))
+        zk_ref = np.asarray(model.get_Qk(q_ref_hat))
+        dzk = np.asarray(model.get_Qk(model.q_hat - q_ref_hat))
         rdek = dek / np.maximum(0.5 * (ek_model + ek_ref), self.errspec_eps)
         rdzk = dzk / np.maximum(0.5 * (zk_model + zk_ref), self.errspec_eps)
         return rdek, rdzk
 
     def _enorm(self, model, dpsi_hat):
-        ene_dens = 0.5 * (model.kk**2 + model.gamma**2) * cp.abs(dpsi_hat)**2
+        """Square root of physical generalized energy, distinct from the L2 norm."""
+        ene_dens = 0.5 * model.inversion_symbol * cp.abs(dpsi_hat)**2
         norm_fac = 1.0 / (model.Nx * model.Ny) ** 2
         ene = norm_fac * float(cp.sum(ene_dens, dtype=cp.float64).get())
         return float(np.sqrt(max(ene, 0.0)))
@@ -342,27 +354,41 @@ class QGCDA:
         ens = norm_fac * float(cp.sum(ens_dens, dtype=cp.float64).get())
         return float(np.sqrt(max(ens, 0.0)))
 
+    def _l2norm(self, model, dpsi_hat):
+        """Velocity L2 norm, sqrt(<delta u^2 + delta v^2>), as in CLE."""
+        dens = model.kk**2 * cp.abs(dpsi_hat)**2
+        norm2 = float(cp.sum(dens, dtype=cp.float64).get()) / (model.Nx * model.Ny)**2
+        return float(np.sqrt(max(norm2, 0.0)))
+
     def _err_budget(self, model):
-        """Energy-normalized finite-error E/Z/P spectra and budget terms."""
+        """Velocity-L2-normalized finite-error E/Z/P/K spectra and tendencies.
+
+        These are instantaneous continuous tendencies. OT2003 insertion and
+        the time-step spectral filter are discrete changes, not RHS work.
+        Zero velocity error has no normalized direction and returns NaNs.
+        """
         dq_hat, dpsi_hat, q_ref_hat = self._delta_hats(model)
-        enorm = self._enorm(model, dpsi_hat)
-        epsi = dpsi_hat / max(enorm, 1e-300)
-        eq = (model.lap - model.gamma**2) * epsi
-        erv = eq + model.gamma**2 * epsi
+        l2norm = self._l2norm(model, dpsi_hat)
+        if l2norm == 0:
+            empty = np.full(len(model.kk_iso), np.nan)
+            return tuple(empty.copy() for _ in range(27))
+        epsi = dpsi_hat / l2norm
+        eq = dq_hat / l2norm
         p_ref_hat = model.inversion * q_ref_hat
         k2 = model.kk**2
 
         evk = self._shell_sum(
-            model, 0.5 * (k2 + model.gamma**2) * cp.abs(epsi)**2)
+            model, 0.5 * model.inversion_symbol * cp.abs(epsi)**2)
         zvk = self._shell_sum(model, 0.5 * cp.abs(eq)**2)
         pvk = self._shell_sum(model, 0.5 * k2 * cp.abs(eq)**2)
+        kvk = self._shell_sum(model, 0.5 * k2 * cp.abs(epsi)**2)
 
         j_adv = model._compute_jacobian(p_ref_hat, eq)
         j_prod = model._compute_jacobian(epsi, q_ref_hat)
         # Finite-amplitude correction to the linear CLE budget. Since epsi/eq
-        # are normalized by ||delta psi||_E, the quadratic error interaction
+        # are normalized by ||delta u||_2, the quadratic error interaction
         # enters the normalized error equation multiplied by the raw error norm.
-        j_finite = enorm * model._compute_jacobian(epsi, eq)
+        j_finite = l2norm * model._compute_jacobian(epsi, eq)
 
         teadv = cp.real(cp.conj(epsi) * j_adv)
         teprod = cp.real(cp.conj(epsi) * j_prod)
@@ -384,8 +410,8 @@ class QGCDA:
         tpprodk = self._shell_sum(model, tpprod)
         tpfinitek = self._shell_sum(model, tpfinite)
 
-        fric_term = -model.friction_mask * model.friction * erv
-        visc_term = model.hylap * erv
+        fric_term = -model.friction_mask * model.friction * eq
+        visc_term = model.hylap * eq
         tefric = -cp.real(cp.conj(epsi) * fric_term)
         tzfric = cp.real(cp.conj(eq) * fric_term)
         tevisc = -cp.real(cp.conj(epsi) * visc_term)
@@ -398,9 +424,9 @@ class QGCDA:
         tzvisck = self._shell_sum(model, tzvisc)
         tpvisck = self._shell_sum(model, tpvisc)
 
-        # DA acts in the raw q equation. Divide it by the raw error energy norm
-        # before contracting it with the energy-normalized error fields.
-        da_err_term = model.da_term / max(enorm, 1e-300)
+        # Reference and replicas share exactly the same prescribed forcing,
+        # so it cancels. DA acts only on the replica and uses the raw norm.
+        da_err_term = model.da_term / l2norm
         teda_err = -cp.real(cp.conj(epsi) * da_err_term)
         tzda_err = cp.real(cp.conj(eq) * da_err_term)
         tpda_err = k2 * tzda_err
@@ -408,10 +434,17 @@ class QGCDA:
         tzdafk = self._shell_sum(model, tzda_err)
         tpdafk = self._shell_sum(model, tpda_err)
 
+        # Kinetic work is k^2/A times generalized-energy work, A=-q_operator.
+        # Using the inversion also handles the fixed zero streamfunction mode.
+        kinetic_weight = -k2 * model.inversion
+        kinetic_terms = tuple(self._shell_sum(model, kinetic_weight * term)
+                              for term in (teadv, teprod, tefinite, tefric,
+                                           tevisc, teda_err))
+
         return (evk, zvk, pvk, teadvk, teprodk, tefinitek, tefrick,
                 tevisck, tzadvk, tzprodk, tzfinitek, tzfrick, tzvisck,
                 tpadvk, tpprodk, tpfinitek, tpvisck, tedafk,
-                tzdafk, tpdafk)
+                tzdafk, tpdafk, kvk, *kinetic_terms)
 
     def _bind_var(self, ds, name, dtype, dims, description=None):
         if name in ds.variables:
@@ -430,18 +463,25 @@ class QGCDA:
         diag['dz'] = self._bind_var(
             model.ds, 'dz', 'f8', ('time',),
             'finite error enstrophy, spatial-mean Parseval total over full FFT square')
+        diag['dk'] = self._bind_var(
+            model.ds, 'dk', 'f8', ('time',),
+            'finite kinetic error energy, 0.5*<delta u^2+delta v^2>, full FFT square')
+        diag['l2norm'] = self._bind_var(
+            model.ds, 'l2norm', 'f8', ('time',),
+            'velocity L2 error norm sqrt(<delta u^2+delta v^2>), full FFT square')
         for name in ('evk', 'zvk', 'pvk', 'teadvk', 'teprodk', 'tefinitek',
                      'tefrick', 'tevisck', 'tzadvk', 'tzprodk',
                      'tzfinitek', 'tzfrick', 'tzvisck', 'tpadvk',
                      'tpprodk', 'tpfinitek', 'tpvisck', 'tedafk',
                      'tzdafk', 'tpdafk', 'tprodk', 'tdissk',
-                     'rdek', 'rdzk'):
+                     'rdek', 'rdzk', 'kvk', 'tkadvk', 'tkprodk', 'tkfinitek',
+                     'tkfrick', 'tkvisck', 'tkdafk'):
             diag[name] = self._bind_var(model.ds, name, 'f4', ('time', 'k'))
-        diag['evk'].description = ('full-energy-normalized error spectrum on complete '
+        diag['evk'].description = ('velocity-L2-normalized generalized energy error spectrum on complete '
                                    'radial shells k < N/2')
-        diag['zvk'].description = ('full-energy-normalized enstrophy spectrum on complete '
+        diag['zvk'].description = ('velocity-L2-normalized scalar variance spectrum on complete '
                                    'radial shells k < N/2')
-        diag['pvk'].description = ('full-energy-normalized error palinstrophy spectrum '
+        diag['pvk'].description = ('velocity-L2-normalized error palinstrophy spectrum '
                                    '0.5 k^2 |delta q|^2 on complete radial shells k < N/2')
         diag['rdek'].description = 'relative finite energy-error spectrum, old eerrk'
         diag['rdzk'].description = 'relative finite enstrophy-error spectrum, old zerrk'
@@ -454,8 +494,8 @@ class QGCDA:
         diag['tpfinitek'].description = ('finite-amplitude nonlinear error palinstrophy '
                                         'budget term on complete radial shells k < N/2')
         diag['tpvisck'].description = ('viscous error palinstrophy tendency on complete '
-                                      'radial shells k < N/2; for gamma=0/all-mode drag, '
-                                      'the omitted drag tendency is -2*friction*pvk')
+                                      'radial shells k < N/2; friction can be recovered '
+                                      'modewise from k^2 times scalar-variance friction work')
         diag['tedafk'].description = (
             'normalized finite-error energy tendency from the instantaneous DA RHS coupling; '
             'zero for impulsive OT2003 insertion, whose saved state is post-insertion')
@@ -467,6 +507,14 @@ class QGCDA:
             'coupling; zero for impulsive OT2003 insertion, whose saved state is post-insertion')
         diag['tprodk'].description = 'combined energy production teadvk + teprodk + tefinitek'
         diag['tdissk'].description = 'combined energy dissipation tefrick + tevisck'
+        diag['kvk'].description = ('velocity-L2-normalized kinetic error spectrum; '
+                                   'full-mode sum is 1/2, radial shells omit corner modes')
+        for name, process in (('tkadvk', 'reference advection'),
+                              ('tkprodk', 'advection of reference q by error velocity'),
+                              ('tkfinitek', 'finite-amplitude nonlinear interaction'),
+                              ('tkfrick', 'friction'), ('tkvisck', 'viscosity'),
+                              ('tkdafk', 'instantaneous DA coupling')):
+            diag[name].description = f'velocity-L2-normalized kinetic error work from {process}'
         return diag
 
     def _save_error_diag(self, model, diag, it):
@@ -475,9 +523,14 @@ class QGCDA:
         (evk, zvk, pvk, teadvk, teprodk, tefinitek, tefrick, tevisck,
          tzadvk, tzprodk, tzfinitek, tzfrick, tzvisck, tpadvk,
          tpprodk, tpfinitek, tpvisck, tedafk, tzdafk,
-         tpdafk) = self._err_budget(model)
+         tpdafk, kvk, tkadvk, tkprodk, tkfinitek, tkfrick, tkvisck,
+         tkdafk) = self._err_budget(model)
         diag['de'][it] = de
         diag['dz'][it] = dz
+        _, dpsi_hat, _ = self._delta_hats(model)
+        l2norm = self._l2norm(model, dpsi_hat)
+        diag['dk'][it] = 0.5 * l2norm**2
+        diag['l2norm'][it] = l2norm
         diag['evk'][it, :] = evk
         diag['zvk'][it, :] = zvk
         diag['pvk'][it, :] = pvk
@@ -502,8 +555,17 @@ class QGCDA:
         diag['tpdafk'][it, :] = tpdafk
         diag['tprodk'][it, :] = teadvk + teprodk + tefinitek
         diag['tdissk'][it, :] = tefrick + tevisck
+        for name, values in (('kvk', kvk), ('tkadvk', tkadvk),
+                             ('tkprodk', tkprodk), ('tkfinitek', tkfinitek),
+                             ('tkfrick', tkfrick), ('tkvisck', tkvisck),
+                             ('tkdafk', tkdafk)):
+            diag[name][it, :] = values
 
     def _set_cda_output_attrs(self, model, role):
+        if (len(model.ds.dimensions['time'])
+                and getattr(model.ds, 'error_normalization', None) != 'velocity_l2'):
+            raise ValueError('CDA diagnostic normalization differs; use a new output directory.')
+        model.ds.error_normalization = 'velocity_l2'
         model.ds.Nobs = self.Nobs
         model.ds.interpolant = self.interpolant
         model.ds.mu = self.mu
@@ -662,6 +724,14 @@ class QGCDA:
         if self.is_gnuding:
             self.m_gnud.ts_scheme = scheme
         self.m_ref.ts_scheme = scheme
+        if self._reference_forcing and scheme == 'ab3':
+            n_start = 0 if self.is_not_rst else int(round(self.rtrst / self.dt))
+            if n_start < 2:
+                for model in (self.m_cda, self.m if self.is_ctrl else None,
+                              self.m_gnud if self.is_gnuding else None):
+                    if model is not None and model.is_not_rst != self.m_ref.is_not_rst:
+                        raise ValueError('Reference-normalized forcing requires matching '
+                                         'AB3/RK4 startup stages; preserve matching histories.')
 
         if self.is_ctrl:
             self.m.savedir = savedir
@@ -794,11 +864,15 @@ class QGCDA:
                     itrst +=1
                     inrst +=1
 
+                forcing_stages = None
+                if self._reference_forcing:
+                    forcing_stages = []
+                    self.m_ref._step_forward(forcing_out=forcing_stages)
                 if self.is_ctrl:
-                    self.m._step_forward()
-                self.m_cda._step_forward() 
+                    self.m._step_forward(forcing_stages=forcing_stages)
+                self.m_cda._step_forward(forcing_stages=forcing_stages)
                 if self.is_gnuding:
-                    self.m_gnud._step_forward()
+                    self.m_gnud._step_forward(forcing_stages=forcing_stages)
                 self.m_cda.da_term[...] = 0.0
                 if self.is_gnuding:
                     self.m_gnud.da_term[...] = 0.0
@@ -811,7 +885,8 @@ class QGCDA:
                     self.m_gnud.t = self.m_gnud.trst + (n + self.intvl_model) * self.dt
 
             if n % self.intvl_ref ==0:
-                self.m_ref._step_forward()
+                if not self._reference_forcing:
+                    self.m_ref._step_forward()
                 self.m_ref.t = self.m_ref.trst + (n + self.intvl_ref) * self.dt
         
         self.close_nc()

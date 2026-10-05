@@ -14,29 +14,59 @@ import os
 
 
 class QGModel:
-    """2D Quasi-Geostrophic turbulence model with spectral methods"""
+    """Nondimensional active-scalar model: q_hat = -(k²+gamma²)^(alpha/2) psi_hat.
+
+    alpha=2 retains the Helmholtz/QG model; alpha=1, gamma=0 is SQG.
+    Nonzero gamma with alpha!=2 defines a chosen screened extension, not
+    the constant-stratification ocean model in turb_sqg.py. In that ocean
+    convention the corresponding nondimensional active scalar is q=-b/(N0*U_ref).
+    Legacy shell diagnostics are grid sums, truncated to kk_iso; divide by
+    Nx*Ny for means. get_invariants() instead returns full-mode means.
+    """
     def __init__(self, Nx, Ny, Lx=2*cp.pi, Ly=2*cp.pi, dt=0.001,
                  beta=0, gamma=0,
                  friction=0.01,k_friction = 20000,hyvisc = 0,hyperorder=1,sp_filtr=False,cl=0,
-                 forcing=None,fscale=4,finput=3,famp=1.,precision='single'):
+                 forcing=None,fscale=4,finput=None,famp=1.,precision='single',
+                 alpha=2., forcing_norm=None):
         """Initialize QG model with grid and parameters
 
         Args:
             Nx, Ny: Grid dimensions
             Lx, Ly: Domain sizes
             dt: Time step
-            beta: Beta parameter (Coriolis gradient)
-            gamma: Stratification parameter
-            friction: Friction coefficient
+            beta: Background q gradient; planetary beta only in the QG case.
+            gamma: Inverse screening length; inverse deformation radius at alpha=2.
+            alpha: Finite nonzero inversion exponent (2=QG, 1 with gamma=0
+                is SQG); negative values define generalized active-scalar models.
+            friction: Friction coefficient acting on q
             k_friction: Wavenumber cutoff for friction
-            hyperorder: Order of hyperviscosity (1=Laplacian, 2=Biharmonic, etc.)
+            hyperorder: Order of hyperviscosity on q (1=Laplacian, 2=Biharmonic, etc.)
             sp_filtr: Whether to apply spectral filter
             cl: Leith parameter for biharmonic viscosity
-            forcing: Forcing type ('wind', 'thuburn', 'markov', 'kflow', None)
+            forcing: Forcing type ('wind', 'thuburn', 'markov', 'kflow',
+                'psi_kflow', None). psi_kflow prescribes the steady tendency
+                Fpsi=famp*sin(fscale*y), converted to Fq by q_operator.
             fscale: Forcing wavenumber scale
-            finput: Forcing enstrophy injection rate
-            famp: Forcing amplitude. Ignored for 'kflow', which uses
-                unit-amplitude forcing f = sin(k_f*y)e_x.
+            forcing_norm: None preserves legacy forcing. Explicit 'none'
+                uses the raw q forcing; 'amplitude' fixes its spatial RMS
+                to famp; 'enstrophy' fixes <q*Fq> to finput; 'energy' fixes
+                -<psi*Fq> to finput; 'kinetic_energy' fixes the forcing
+                contribution to d<|grad psi|^2/2>/dt to finput.
+                These are full-grid spatial means.
+                Injection targets hold at the RHS level; very small initial
+                q can require a much smaller dt to resolve the feedback.
+                CDA/CLE reuse the reference's forcing at each RHS stage;
+                the injection target then applies to the reference only.
+                Markov accepts only None/'none' and keeps its native process.
+            finput: Nonnegative injection target for 'enstrophy'/'energy'/'kinetic_energy';
+                required in those modes and unused otherwise. Enstrophy
+                here means q variance/2; energy means -<psi*q>/2, including
+                for SQG (where this energy differs from surface kinetic energy).
+            famp: Spatial RMS target in 'amplitude' mode, or the native
+                Markov amplitude. Legacy wind also uses famp; legacy kflow
+                uses unit-amplitude velocity forcing f = sin(k_f*y)e_x.
+                For psi_kflow, famp is the nonnegative peak amplitude of
+                Fpsi; forcing_norm must be None or 'none' (no normalization).
             precision: 'single' (float32/complex64 state, the historical
                 behavior) or 'double' (float64/complex128). Restart files are
                 written at the working precision (c8/c16), so a run cannot
@@ -44,6 +74,28 @@ class QGModel:
         """
         if precision not in ('single', 'double'):
             raise ValueError(f"precision must be 'single' or 'double', got {precision!r}")
+        if not np.isfinite(alpha) or alpha == 0:
+            raise ValueError('alpha must be finite and nonzero.')
+        if not np.isfinite(gamma) or gamma < 0:
+            raise ValueError('gamma must be finite and nonnegative.')
+        self.alpha = float(alpha)
+        if cl and self.alpha != 2:
+            raise ValueError('Leith closure currently requires alpha=2.')
+        if forcing not in (None, 'wind', 'thuburn', 'markov', 'kflow', 'psi_kflow'):
+            raise ValueError(f'Unknown forcing scheme: {forcing!r}')
+        if forcing_norm not in (None, 'none', 'amplitude', 'enstrophy', 'energy', 'kinetic_energy'):
+            raise ValueError('forcing_norm must be None, none, amplitude, enstrophy, energy, or kinetic_energy.')
+        if forcing in (None, 'markov') and forcing_norm not in (None, 'none'):
+            raise ValueError('External and native Markov forcing bypass forcing normalization.')
+        if forcing == 'psi_kflow' and forcing_norm not in (None, 'none'):
+            raise ValueError("psi_kflow requires forcing_norm=None or 'none'; famp fixes Fpsi's peak amplitude.")
+        if (forcing == 'psi_kflow' or forcing_norm == 'amplitude') and (not np.isfinite(famp) or famp < 0):
+            raise ValueError('Forcing amplitude requires finite famp >= 0.')
+        if forcing_norm in ('enstrophy', 'energy', 'kinetic_energy'):
+            if finput is None or not np.isfinite(finput) or finput < 0:
+                raise ValueError('Injection normalization requires an explicit finite finput >= 0.')
+        if forcing == 'kflow' and self.alpha != 2 and forcing_norm is None:
+            raise ValueError('Legacy kflow requires alpha=2; set forcing_norm explicitly to force q.')
         self.precision = precision
         self.rdtype = cp.float32 if precision == 'single' else cp.float64
         self.cdtype = cp.complex64 if precision == 'single' else cp.complex128
@@ -66,10 +118,12 @@ class QGModel:
         self.sp_filtr = sp_filtr # spectral filter impose on the tail of spectral (Arbic 2003)
         self.cl = cl #leith parameter
         self.forcing = forcing
+        self.forcing_norm = forcing_norm
         self.fscale = fscale # scale of wind
-        self.finput = finput # enstrophy injection rate of wind
+        self.finput = finput # active only for explicit injection normalization
         self.famp = famp
         self.force_q = cp.zeros((self.Ny, self.Nx), dtype=self.cdtype)
+        self._raw_force_q = None
         self.da_term = cp.zeros((self.Ny, self.Nx), dtype=self.cdtype)
         self.k1_p = cp.zeros((self.Ny, self.Nx), dtype=self.cdtype)
         self.k1_pp = cp.zeros((self.Ny, self.Nx), dtype=self.cdtype)
@@ -149,8 +203,17 @@ class QGModel:
         self.filtr[0,0] = 1.0
         
     def _prebuild_operator(self):
-        #inversion of poisson/helmholtz equation
-        self.inversion = 1/(-self.kx2d**2-self.ky2d**2-self.gamma**2) 
+        # Shared inversion symbol. Keep the alpha=2 arithmetic unchanged.
+        k2 = self.kx2d**2+self.ky2d**2
+        self.inversion_symbol = k2+self.gamma**2
+        if self.alpha != 2:
+            # Zero mean is excluded from inversion, also for negative powers.
+            nonzero = self.inversion_symbol > 0
+            self.inversion_symbol[nonzero] = self.inversion_symbol[nonzero]**(self.alpha/2)
+        self.q_operator = -self.inversion_symbol
+        self.inversion = cp.zeros_like(self.inversion_symbol)
+        nonzero = self.inversion_symbol > 0
+        self.inversion[nonzero] = -1/self.inversion_symbol[nonzero]
         self.inversion[0,0] = 0.0
         # laplacian
         self.lap = -(self.kx2d**2+self.ky2d**2)
@@ -166,6 +229,10 @@ class QGModel:
             self._init_markovforce(famp=self.famp)
         elif self.forcing == 'kflow':
             self._set_kflow_force()
+        elif self.forcing == 'psi_kflow':
+            self._set_psi_kflow_force()
+        elif self.forcing == 'thuburn' and self.forcing_norm is not None:
+            self._raw_force_q = fft2(0.1*cp.sin(32*np.pi*self.x2d))
         
         self._init_friction()
         self.linear_damping = -self.friction_mask*self.friction + self.hylap
@@ -249,71 +316,98 @@ class QGModel:
         return ft
 
         
-    def _get_rhs(self,q_hat):
+    def _get_rhs(self,q_hat,time=None,force_q=None,forcing_out=None):
         """Compute right-hand side of QG dynamics equation
         
         Returns the tendency from all processes: advection, beta effect, damping
         """
         p_hat = self.inversion*q_hat # invert to get streamfunction
-        if self.gamma:
-            rv_hat = q_hat + self.gamma**2*p_hat # relative vorticity
-        else:
-            rv_hat = q_hat
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
-        damping_term = self.linear_damping*rv_hat
+        damping_term = self.linear_damping*q_hat
         if self.cl:
-            damping_term += self._compute_leith_term(rv_hat)
+            damping_term += self._compute_leith_term(q_hat)
 
         rhs = damping_term - jacobian_term
         if self.beta:
             rhs -= self.beta*self.kx2d*1j*p_hat
-        rhs += self.force_q
+        if force_q is None:
+            force_q = self._forcing_at_state(q_hat, p_hat, time)
+        if forcing_out is not None:
+            forcing_out.append(force_q.copy())
+        rhs += force_q
         rhs += self.da_term
         return self._enforce_spectral_constraints(rhs)
 
-    def _rk4(self, q_hat):
+    def _relative_vorticity(self, p_hat, q_hat):
+        """Diagnose Delta psi, retaining legacy alpha=2 arithmetic."""
+        if self.alpha == 2:
+            return q_hat + self.gamma**2*p_hat if self.gamma else q_hat
+        return self.lap*p_hat
+
+    def _q_from_psi(self, p_hat):
+        if self.alpha == 2:
+            return self.lap*p_hat - self.gamma**2*p_hat
+        return self.q_operator*p_hat
+
+    def _rk4(self, q_hat, forcing_stages=None, forcing_out=None):
         """Compute 4th order Runge-Kutta stages"""
-        k1 = self._get_rhs(q_hat)
-        k2 = self._get_rhs(q_hat + 0.5 * self.dt * k1)
-        k3 = self._get_rhs(q_hat + 0.5 * self.dt * k2)
-        k4 = self._get_rhs(q_hat + self.dt * k3)
+        forces = (None,) * 4 if forcing_stages is None else forcing_stages
+        k1 = self._get_rhs(q_hat, self.t, forces[0], forcing_out)
+        k2 = self._get_rhs(q_hat + 0.5 * self.dt * k1, self.t + 0.5*self.dt,
+                           forces[1], forcing_out)
+        k3 = self._get_rhs(q_hat + 0.5 * self.dt * k2, self.t + 0.5*self.dt,
+                           forces[2], forcing_out)
+        k4 = self._get_rhs(q_hat + self.dt * k3, self.t + self.dt,
+                           forces[3], forcing_out)
 
         return k1,k2,k3,k4
 
-    def _step_forward(self):
-        """Advance simulation one time step using specified scheme"""
-        if self.forcing == 'wind':
+    def _step_forward(self, forcing_stages=None, forcing_out=None):
+        """Advance one step, optionally recording or accepting reference forcing.
+
+        A forcing list contains the one AB3 or four RK4 RHS values, followed
+        by the endpoint value for diagnostics. Default stepping is unchanged.
+        """
+        if forcing_out is not None:
+            forcing_out.clear()
+        if forcing_stages is not None:
+            rk4_step = self.ts_scheme == 'rk4' or (self.is_not_rst and self.n_steps < 2)
+            if len(forcing_stages) != (5 if rk4_step else 2):
+                raise ValueError('Reference and replica must use matching RHS stages.')
+        elif self.forcing == 'wind' and self.forcing_norm is None:
             self._set_windforce()
-        elif self.forcing =='thuburn':
+        elif self.forcing =='thuburn' and self.forcing_norm is None:
             self.force_q = fft2(0.1*cp.sin(32*np.pi*self.x2d))
         elif self.forcing == 'markov':
             self._update_markovforce()
-        # kflow forcing is time independent and was built during __init__.
+        # kflow and psi_kflow are steady and were built during __init__.
         self._enforce_spectral_constraints(self.q_hat)
         q = self.q_hat
 
         if self.ts_scheme=='rk4':
             # 4th order Runge-Kutta integration
-            k1,k2,k3,k4 = self._rk4(q)
+            k1,k2,k3,k4 = self._rk4(q, forcing_stages, forcing_out)
             self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
         elif self.ts_scheme == 'ab3':
             # 3rd order Adams-Bashforth integration
             if self.is_not_rst:
                 if self.n_steps == 0:
-                    k1,k2,k3,k4 = self._rk4(q)
+                    k1,k2,k3,k4 = self._rk4(q, forcing_stages, forcing_out)
                     self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
                     self.k1_pp = k1 # store RHS history for AB3
                 elif self.n_steps == 1:
-                    k1,k2,k3,k4 = self._rk4(q)
+                    k1,k2,k3,k4 = self._rk4(q, forcing_stages, forcing_out)
                     self.q_hat = q + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
                     self.k1_p = k1
                 else:
-                    k1 = self._get_rhs(q)
+                    k1 = self._get_rhs(q, force_q=None if forcing_stages is None else forcing_stages[0],
+                                       forcing_out=forcing_out)
                     self.q_hat = q + self.dt/12*(23*k1-16*self.k1_p+5*self.k1_pp)
                     self.k1_pp = self.k1_p
                     self.k1_p = k1
             else:
-                k1 = self._get_rhs(q)
+                k1 = self._get_rhs(q, force_q=None if forcing_stages is None else forcing_stages[0],
+                                   forcing_out=forcing_out)
                 self.q_hat = q + self.dt/12*(23*k1-16*self.k1_p+5*self.k1_pp)
                 self.k1_pp = self.k1_p
                 self.k1_p = k1
@@ -321,10 +415,11 @@ class QGModel:
         self.q_hat *=self.filtr # apply spectral filter
         self._enforce_spectral_constraints(self.q_hat)
         self.p_hat = self.inversion*self.q_hat
-        if self.gamma:
-            self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
-        else:
-            self.rv_hat = self.q_hat
+        self.rv_hat = self._relative_vorticity(self.p_hat, self.q_hat)
+        self.force_q = (self._forcing_at_state(self.q_hat, self.p_hat, self.t + self.dt)
+                        if forcing_stages is None else forcing_stages[-1].copy())
+        if forcing_out is not None:
+            forcing_out.append(self.force_q.copy())
         
     
     def _compute_jacobian(self,p_hat,q_hat):
@@ -348,29 +443,29 @@ class QGModel:
     
         return jacob_hat
 
-    def _compute_leith_term(self, rv_hat=None):
+    def _compute_leith_term(self, q_hat=None):
         """Compute biharmonic Leith viscosity term
         
         Args:
-            rv_hat: Relative vorticity in Fourier space (uses current value if None)
+            q_hat: Active scalar in Fourier space (uses current value if None)
         """
         if self.cl == 0:
             return 0.0
-        if rv_hat is None:
-            rv_hat = self.rv_hat # use current value for stable stepping
-        dxrv_hat = self.kx2d*1j*rv_hat
-        dyrv_hat = self.ky2d*1j*rv_hat
+        if q_hat is None:
+            q_hat = self.q_hat # use current value for stable stepping
+        dxq_hat = self.kx2d*1j*q_hat
+        dyq_hat = self.ky2d*1j*q_hat
         
-        dxrv_r = ifft2(self._padding(dxrv_hat)).real
-        dyrv_r = ifft2(self._padding(dyrv_hat)).real
+        dxq_r = ifft2(self._padding(dxq_hat)).real
+        dyq_r = ifft2(self._padding(dyq_hat)).real
         
-        grad_rv_r = cp.sqrt(dxrv_r**2+dyrv_r**2)
+        grad_q_r = cp.sqrt(dxq_r**2+dyq_r**2)
         
         nabla = self.Lx/self.Nx
-        nu_e = (self.cl*nabla)**3*grad_rv_r # eddy viscosity
+        nu_e = (self.cl*nabla)**3*grad_q_r # eddy viscosity
         
-        flux_x_r = nu_e*dxrv_r
-        flux_y_r = nu_e*dyrv_r
+        flux_x_r = nu_e*dxq_r
+        flux_y_r = nu_e*dyq_r
 
         flux_x_hat = self.kx2d*1j*self._unpadding(fft2(flux_x_r))
         flux_y_hat = self.ky2d*1j*self._unpadding(fft2(flux_y_r))
@@ -396,7 +491,7 @@ class QGModel:
             self._enforce_spectral_constraints(self.p_hat)
             self.rv_hat = self.lap*self.p_hat
             # initial potential vorticity (q)
-            self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
+            self.q_hat = self._q_from_psi(self.p_hat)
             # normalize mean of total energy to 0.5
             ene_tot = self.get_Etot(self.p_hat)
             norm_fac = cp.sqrt(self.eini/(ene_tot/(self.Nx*self.Ny)))
@@ -404,12 +499,33 @@ class QGModel:
             # initial relavitve vorticity (rv)
             self.rv_hat = self.lap*self.p_hat
             # initial potential vorticity (q)
-            self.q_hat = self.rv_hat - self.gamma**2*self.p_hat
+            self.q_hat = self._q_from_psi(self.p_hat)
         
     def set_initial_condition(self,scheme='gauss',eini=0,q_ini=None,trst=0):
+        """Initialize nondimensional q. 'field' accepts a real (Ny,Nx) field
+        or its Hermitian full FFT. eini is mean generalized energy.
+        Raw 'rst' arrays must come from the same alpha/gamma/damping model;
+        unlike a NetCDF append, an array contains no model metadata to check.
+        """
         self.eini = eini
         self.trst = trst
-        if scheme == 'jcm1984':
+        if scheme == 'field':
+            field = cp.asarray(q_ini)
+            if field.shape != (self.Ny, self.Nx) or not bool(cp.all(cp.isfinite(field))):
+                raise ValueError('q_ini must be a finite (Ny,Nx) field or full FFT.')
+            if field.dtype.kind == 'c':
+                physical = ifft2(field)
+                scale = max(float(cp.max(cp.abs(physical))), np.finfo(float).tiny)
+                if float(cp.max(cp.abs(physical.imag))) > 100*np.finfo(self.rdtype).eps*scale:
+                    raise ValueError('Spectral q_ini must represent a real field.')
+                self.q_hat = field.astype(self.cdtype).copy()
+            else:
+                self.q_hat = fft2(field.astype(self.rdtype))
+            self._enforce_spectral_constraints(self.q_hat)
+            self.p_hat = self.inversion*self.q_hat
+            if eini:
+                self._norm_energy()
+        elif scheme == 'jcm1984':
             k_peak = 6
             # kk**(-A)*(1 + (kk/k0)**4)**(-B)
             # generate Fourier conponent of initial streamfunction field
@@ -436,7 +552,7 @@ class QGModel:
             # self._norm_energy()
 
         elif scheme == 'gauss':
-            psi_phys = cp.random.randn(self.Nx, self.Ny).astype(self.rdtype)
+            psi_phys = cp.random.randn(self.Ny, self.Nx).astype(self.rdtype)
             rand_p = fft2(psi_phys)
             fmask = cp.zeros_like(self.kk)
         
@@ -457,7 +573,7 @@ class QGModel:
                 self._norm_energy()
                 
             self.rv_hat = self.lap * self.p_hat
-            self.q_hat = self.rv_hat - self.gamma**2 * self.p_hat
+            self.q_hat = self._q_from_psi(self.p_hat)
         elif scheme == 'kflow':
             # Kolmogorov-flow CDA starts from q_tilde(0)=0.
             # The observed low modes p(0) are inserted by cda_turb2d.py:ot2003.
@@ -503,26 +619,99 @@ class QGModel:
             self.q_hat *=norm_fac
             self.p_hat = self.inversion*self.q_hat
             self.rv_hat = self.lap*self.p_hat
+        else:
+            raise ValueError(f'Unknown initial-condition scheme: {scheme!r}')
         self._enforce_spectral_constraints(self.q_hat)
         self._enforce_spectral_constraints(self.k1_p)
         self._enforce_spectral_constraints(self.k1_pp)
         self.p_hat = self.inversion*self.q_hat
-        if self.gamma:
-            self.rv_hat = self.q_hat + self.gamma**2*self.p_hat
-        else:
-            self.rv_hat = self.q_hat
+        self.rv_hat = self._relative_vorticity(self.p_hat, self.q_hat)
         self.Etot = self.get_Etot(self.p_hat)
         self.Ek = self.get_Ek(self.p_hat)
-        self.tenlk, self.tznlk, self.fenlk, self.fznlk = self.get_diagNL(self.p_hat,self.q_hat)   
+        self.tenlk, self.tqnlk, self.fenlk, self.fqnlk = self.get_diagNL(self.p_hat,self.q_hat)
+        self.force_q = self._forcing_at_state(self.q_hat, self.p_hat, self.trst)
      
 ### forcing term 
+    def _forcing_at_state(self, q_hat, p_hat=None, time=None):
+        """Evaluate deterministic forcing at this RHS state and time.
+
+        Native Markov and legacy/external forcing are held fixed through
+        each step. Explicit modes project the raw pattern before measuring
+        its RMS or work, using Parseval over the full FFT (not shell sums).
+        Injection control multiplies by a signed scalar: a negative raw
+        work reverses the pattern, and zero/near-zero work raises an error.
+        """
+        if self.forcing_norm is None or self.forcing in (None, 'markov'):
+            return self.force_q
+        if self.forcing == 'wind':
+            time = self.t if time is None else time
+            phi_x = cp.pi*cp.sin(1.5*time)
+            phi_y = cp.pi*cp.sin(1.4*time)
+            raw = fft2(cp.cos(self.fscale*self.y2d + phi_y)
+                       - cp.cos(self.fscale*self.x2d + phi_x))
+        else:
+            raw = self._raw_force_q.copy()
+        self._enforce_spectral_constraints(raw)
+        raw[0, 0] = 0.0
+        if self.forcing_norm == 'none':
+            return raw.astype(self.cdtype)
+        target = self.famp if self.forcing_norm == 'amplitude' else self.finput
+        if target == 0:
+            return cp.zeros_like(raw, dtype=self.cdtype)
+        mean_fac = 1.0/(self.Nx*self.Ny)**2
+        raw2 = float(cp.sum(cp.abs(raw)**2, dtype=cp.float64))*mean_fac
+        if not np.isfinite(raw2) or raw2 <= 0:
+            raise ValueError('Cannot normalize a zero or nonfinite forcing pattern.')
+        if self.forcing_norm == 'amplitude':
+            scale = target/np.sqrt(raw2)
+        else:
+            if p_hat is None:
+                p_hat = self.inversion*q_hat
+            gradient = q_hat if self.forcing_norm == 'enstrophy' else -p_hat
+            if self.forcing_norm == 'kinetic_energy':
+                # dK/dq = k^2 * inversion * psi, with K=<|grad psi|^2>/2.
+                gradient = self.kk**2*self.inversion*p_hat
+            work = float(cp.sum(cp.real(cp.conj(gradient)*raw), dtype=cp.float64))*mean_fac
+            work_scale = float(cp.sum(cp.abs(gradient)*cp.abs(raw), dtype=cp.float64))*mean_fac
+            tolerance = 32*np.finfo(self.rdtype).eps*work_scale
+            if not np.isfinite(work) or not np.isfinite(tolerance) or abs(work) <= tolerance:
+                raise ValueError('Cannot impose finput: forcing work is zero or near zero; '
+                                 'use a nonzero initial field overlapping the forcing pattern.')
+            scale = target/work
+        force = (scale*raw).astype(self.cdtype)
+        if not bool(cp.all(cp.isfinite(force))):
+            raise ValueError('Normalized forcing exceeds the working precision; reduce the target.')
+        return force
+
     def _set_kflow_force(self):
         # Kolmogorov velocity forcing
         # f = sin(k_f y) e_x. The vorticity equation receives curl(f).
+        # Explicit modes use this same q pattern for any inversion exponent.
         Fq = -self.fscale*cp.cos(self.fscale*self.y2d)
         Fq = Fq.astype(self.rdtype)
         Fq -= cp.mean(Fq)
         self.force_q = fft2(Fq)
+        if self.forcing_norm is not None:
+            self._raw_force_q = self.force_q.copy()
+
+    def _set_psi_kflow_force(self):
+        """Prescribe a periodic single-mode Fpsi, using the model's q sign."""
+        if not np.isfinite(self.fscale) or self.fscale <= 0:
+            raise ValueError('psi_kflow requires finite fscale > 0.')
+        mode = self.fscale*float(self.Ly)/(2*np.pi)
+        mode_index = int(round(mode))
+        tolerance = 32*np.finfo(self.rdtype).eps*max(1.0, abs(mode))
+        if abs(mode-mode_index) > tolerance or mode_index < 1:
+            raise ValueError('psi_kflow requires fscale*Ly/(2*pi) to be a positive integer.')
+        if mode_index >= (self.Ny+1)//2:
+            raise ValueError('psi_kflow forcing must lie below the Nyquist cutoff.')
+        Fpsi_hat = fft2((self.famp*cp.sin(self.fscale*self.y2d)).astype(self.rdtype))
+        self._enforce_spectral_constraints(Fpsi_hat)
+        Fpsi_hat[0, 0] = 0.0
+        self.force_q = (self.q_operator*Fpsi_hat).astype(self.cdtype)
+        if not bool(cp.all(cp.isfinite(self.force_q))):
+            raise ValueError('psi_kflow forcing exceeds the working precision.')
+        self._raw_force_q = self.force_q.copy()
 
     def _set_windforce(self):
         # graham 2013 and Frezat 2022
@@ -537,10 +726,6 @@ class QGModel:
 
         Fq_hat = fft2(norm_fac*Fq) # amplified to get large energy
         
-        # inputF = cp.sum(cp.real(cp.conj(self.q_hat)*Fq_hat))/(self.Nx*self.Ny)**2 # current enstrophy injection?
-        # inputF = -cp.sum(cp.real(cp.conj(self.p_hat) * Fq_hat)) / (self.Nx * self.Ny)**2 # energy injection
-        # norm_fac = 1.*(self.finput)/(inputF)
-        # Fq_hat *= norm_fac
         self.force_q = Fq_hat
         
         # plt.imshow(ifft2(Fq_hat).real.get())
@@ -606,174 +791,225 @@ class QGModel:
 
 ## diagnostic term
     def get_Ek(self,p_hat):
-        """Compute isotropic energy spectrum
+        """Generalized energy -<psi q>/2, in legacy grid-sum shell units.
         
         Integrates energy density in spectral shells using Parseval's theorem
         """
         # Energy density in spectral space
-        ene_dens = 0.5*(self.kk**2+self.gamma**2)*cp.abs(p_hat)**2
+        ene_dens = 0.5*self.inversion_symbol*cp.abs(p_hat)**2
         # Physical space using Parseval's Theorem
         norm_fac = 1/(self.Nx*self.Ny)
         ene_kk = npg.aggregate(self.kk_idx.ravel().get(),ene_dens.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         return ene_kk
     def get_Etot(self,p_hat):
-        """Compute total energy"""
+        """Generalized energy summed over retained isotropic shells, in grid-sum units."""
         ene_kk = self.get_Ek(p_hat)
         ene_tot = np.sum(ene_kk) 
         return ene_tot
 
     def get_Vrms(self,p_hat):
-        """Compute RMS velocity"""
-        ene_tot = self.get_Etot(p_hat)
+        """RMS velocity from the retained isotropic shells."""
+        ene_tot = self.get_Ktot(p_hat)
         vrms = np.sqrt(2*ene_tot/(self.Nx*self.Ny))
         return vrms
+
+    def get_Kk(self, p_hat):
+        """Kinetic energy, independent of alpha/gamma; legacy shell units."""
+        density = 0.5*self.kk**2*cp.abs(p_hat)**2
+        return npg.aggregate(self.kk_idx.ravel().get(), density.ravel().get(),
+                             func='sum')[self.kk_range.get()] / (self.Nx*self.Ny)
+
+    def get_Ktot(self, p_hat):
+        """Kinetic energy summed over retained isotropic shells, in grid-sum units."""
+        return float(np.sum(self.get_Kk(p_hat)))
+
+    def get_invariants(self, q_hat=None):
+        """Full retained-mode horizontal means (no isotropic-shell cutoff).
+
+        E=-<psi q>/2 and Q=<q²>/2 are inviscid invariants. K=<|grad psi|²>/2
+        equals E for alpha=2,gamma=0 and Q for alpha=1,gamma=0, at zero mean.
+        Z=<omega²>/2 is relative-vorticity enstrophy, generally not an invariant.
+        get_Etot/get_Qtot/get_Ztot/get_Ktot instead return truncated shell grid sums;
+        divide those by Nx*Ny for spatial means over the retained shells.
+        """
+        q_hat = self.q_hat if q_hat is None else q_hat
+        p_hat = self.inversion*q_hat
+        norm = (self.Nx*self.Ny)**2
+        return dict(E=float(cp.sum(0.5*self.inversion_symbol*cp.abs(p_hat)**2))/norm,
+                    Q=float(cp.sum(0.5*cp.abs(q_hat)**2))/norm,
+                    Z=float(cp.sum(0.5*cp.abs(self._relative_vorticity(p_hat, q_hat))**2))/norm,
+                    K=float(cp.sum(0.5*self.kk**2*cp.abs(p_hat)**2))/norm)
     def get_Qrms(self,q_hat):
-        """Compute RMS potential vorticity"""
-        ens_tot = self.get_Ztot(q_hat)
+        """RMS active scalar from the retained isotropic shells."""
+        ens_tot = self.get_Qtot(q_hat)
         qrms = np.sqrt(2*ens_tot/(self.Nx*self.Ny))
         return qrms
-    def get_Zk(self,q_hat):
-        """Compute isotropic enstrophy spectrum"""
-        # Enstrophy density in spectral space
+    def get_Qk(self,q_hat):
+        """Q spectrum (half active-scalar mean square), in grid-sum units.
+
+        This is enstrophy for ordinary 2D turbulence and half the active-scalar
+        variance for zero-mean q. Only retained isotropic shells are returned.
+        """
+        # Half scalar mean-square density in spectral space
         ens_dens = 0.5*np.abs(q_hat)**2
         norm_fac = 1/(self.Nx*self.Ny)
-        # Isotropic enstrophy spectrum in physical space using Parseval's Theorem
+        # Isotropic scalar mean-square spectrum using Parseval's theorem
         ens_kk = npg.aggregate(self.kk_idx.ravel().get(),ens_dens.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         return ens_kk
-    def get_Ztot(self,q_hat):
-        """Compute total enstrophy"""
-        ens_kk = self.get_Zk(q_hat)
+    def get_Qtot(self,q_hat):
+        """Half active-scalar mean square summed over retained isotropic shells, in grid-sum units."""
+        ens_kk = self.get_Qk(q_hat)
         ens_tot = np.sum(ens_kk)
         return ens_tot
+
+    def get_Zk(self, rv_hat):
+        """Relative-vorticity enstrophy spectrum, in grid-sum shell units."""
+        return self.get_Qk(rv_hat)
+
+    def get_Ztot(self, rv_hat):
+        """Relative-vorticity enstrophy over retained isotropic shells, in grid-sum units."""
+        return float(np.sum(self.get_Zk(rv_hat)))
+
+    def get_sigma(self, z_kk=None):
+        """Cumulative deformation rate sqrt(sum_{j<=k} Z(j)).
+
+        Zk uses grid-sum shell units, so divide by Nx*Ny for spatial means
+        before taking the square root. This follows the retained rounded shells.
+        """
+        z_kk = self.get_Zk(self.rv_hat) if z_kk is None else z_kk
+        return np.sqrt(np.cumsum(z_kk)/(self.Nx*self.Ny))
+
     def get_TENL(self,p_hat,q_hat):
         """Compute spectral energy transfer from non-linear advection"""
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
-        # Energy transfer: T_E = -Re(p* * J)
+        # Generalized-energy transfer: T_E = Re(p* * J), since dq/dt = -J.
         tenl = cp.real(cp.conj(p_hat)*jacobian_term)
         return tenl
     
-    def get_TZNL(self,p_hat,q_hat):
-        """Compute spectral enstrophy transfer from non-linear advection"""
+    def get_TQNL(self,p_hat,q_hat):
+        """Compute spectral scalar-variance transfer from non-linear advection"""
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
-        # Enstrophy transfer: T_Z = -Re(q* * J)
-        tznl = -cp.real(cp.conj(q_hat)*jacobian_term)
-        return tznl
+        # Scalar-variance transfer: T_Q = -Re(q* * J)
+        tqnl = -cp.real(cp.conj(q_hat)*jacobian_term)
+        return tqnl
 
     def get_diagNL(self,p_hat,q_hat):
-        """Compute energy and enstrophy budgets from non-linear advection
+        """Compute generalized-energy and scalar-variance budgets from non-linear advection
         
         Returns spectral transfer and flux for both quantities
         """
         jacobian_term = self._compute_jacobian(p_hat,q_hat)
         # spectral energy transfer of non-linear advection
         tenl = cp.real(cp.conj(p_hat)*jacobian_term)
-        # spectral enstrophy transfer of non-linear advection
-        tznl = -cp.real(cp.conj(q_hat)*jacobian_term)
+        # spectral scalar-variance transfer of non-linear advection
+        tqnl = -cp.real(cp.conj(q_hat)*jacobian_term)
 
         # Isotropic spectrum of energy transfer of non-linear advection 
         # In physical space using spectral aggregation
         norm_fac = 1/(self.Nx*self.Ny)
         tenl_kk = npg.aggregate(self.kk_idx.ravel().get(),tenl.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer of non-linear advection
+        # Isotropic spectrum of scalar variance transfer of non-linear advection
         # In physical space 
-        tznl_kk = npg.aggregate(self.kk_idx.ravel().get(),tznl.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        tqnl_kk = npg.aggregate(self.kk_idx.ravel().get(),tqnl.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of energy flux of non-linear advection
         fenl_kk = -np.cumsum(tenl_kk)
-        # Isotropic spectrum of enstrophy flux of non-linear advection
-        fznl_kk = -np.cumsum(tznl_kk)
+        # Isotropic spectrum of scalar variance flux of non-linear advection
+        fqnl_kk = -np.cumsum(tqnl_kk)
 
-        return tenl_kk, tznl_kk, fenl_kk, fznl_kk
+        return tenl_kk, tqnl_kk, fenl_kk, fqnl_kk
 
     def get_diagF(self,p_hat,q_hat,force_q):
-        """Compute energy and enstrophy budgets from forcing
+        """Compute generalized-energy and scalar-variance budgets from forcing
         
         Returns spectral transfer and flux for both quantities
         """
         # spectral energy transfer of forcing
         teF = -cp.real(cp.conj(p_hat)*force_q)
-        # spectral enstrophy transfer of forcing
-        tzF = cp.real(cp.conj(q_hat)*force_q)
+        # spectral scalar-variance transfer of forcing
+        tqF = cp.real(cp.conj(q_hat)*force_q)
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer 
         # In physical space using spectral aggregation
         teF_kk = npg.aggregate(self.kk_idx.ravel().get(),teF.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer 
+        # Isotropic spectrum of scalar variance transfer
         # In physical space 
-        tzF_kk =npg.aggregate(self.kk_idx.ravel().get(),tzF.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        tqF_kk =npg.aggregate(self.kk_idx.ravel().get(),tqF.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of energy flux of forcing
         feF_kk = np.cumsum(teF_kk[::-1])[::-1]
-        # Isotropic spectrum of enstrophy flux of forcing
-        fzF_kk = np.cumsum(tzF_kk[::-1])[::-1]
+        # Isotropic spectrum of scalar variance flux of forcing
+        fqF_kk = np.cumsum(tqF_kk[::-1])[::-1]
 
-        return teF_kk, tzF_kk, feF_kk, fzF_kk
+        return teF_kk, tqF_kk, feF_kk, fqF_kk
 
     def get_diagDa(self,p_hat,q_hat,da_term):
-        """Compute energy and enstrophy budgets from data assimilation nudging
+        """Compute generalized-energy and scalar-variance budgets from data assimilation nudging
         
         Returns spectral transfer and flux for both quantities
         """
         # spectral energy transfer of DA
         teda = -cp.real(cp.conj(p_hat)*da_term)
-        # spectral enstrophy transfer of DA
-        tzda = cp.real(cp.conj(q_hat)*da_term)
+        # spectral scalar-variance transfer of DA
+        tqda = cp.real(cp.conj(q_hat)*da_term)
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer 
         # In physical space using spectral aggregation
         teda_kk = npg.aggregate(self.kk_idx.ravel().get(),teda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer 
+        # Isotropic spectrum of scalar variance transfer
         # In physical space 
-        tzda_kk =npg.aggregate(self.kk_idx.ravel().get(),tzda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        tqda_kk =npg.aggregate(self.kk_idx.ravel().get(),tqda.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of energy flux
         feda_kk = np.cumsum(teda_kk[::-1])[::-1]
-        # Isotropic spectrum of enstrophy flux
-        fzda_kk = np.cumsum(tzda_kk[::-1])[::-1]
+        # Isotropic spectrum of scalar variance flux
+        fqda_kk = np.cumsum(tqda_kk[::-1])[::-1]
 
-        return teda_kk, tzda_kk, feda_kk, fzda_kk
+        return teda_kk, tqda_kk, feda_kk, fqda_kk
 
     def get_diagFric(self,p_hat,q_hat):
-        """Compute energy and enstrophy dissipation from large-scale friction
+        """Compute generalized-energy and scalar-variance dissipation from large-scale friction
         
         Returns spectral dissipation and flux for both quantities
         """
         # spectral energy transfer of friction
-        tefric = -2*self.friction_mask*self.friction* 0.5*self.kk**2*cp.abs(p_hat)**2
-        # spectral enstrophy transfer of friction
-        tzfric = -2*self.friction_mask*self.friction* 0.5*cp.abs(q_hat)**2
+        tendency = -self.friction_mask*self.friction*q_hat
+        tefric = -cp.real(cp.conj(p_hat)*tendency)
+        tqfric = cp.real(cp.conj(q_hat)*tendency)
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer of friction
         # In physical space using spectral aggregation
         tefric_kk = npg.aggregate(self.kk_idx.ravel().get(),tefric.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer of friction
+        # Isotropic spectrum of scalar variance transfer of friction
         # In physical space 
-        tzfric_kk = npg.aggregate(self.kk_idx.ravel().get(),tzfric.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        tqfric_kk = npg.aggregate(self.kk_idx.ravel().get(),tqfric.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of energy flux of friction
         fefric_kk = np.cumsum(tefric_kk[::-1])[::-1]
-        # Isotropic spectrum of enstrophy flux of friction
-        fzfric_kk = np.cumsum(tzfric_kk[::-1])[::-1]
-        return tefric_kk, tzfric_kk, fefric_kk, fzfric_kk
+        # Isotropic spectrum of scalar variance flux of friction
+        fqfric_kk = np.cumsum(tqfric_kk[::-1])[::-1]
+        return tefric_kk, tqfric_kk, fefric_kk, fqfric_kk
 
     def get_diagVisc(self, p_hat, q_hat):
-        """Compute energy and enstrophy dissipation from hyperviscosity
+        """Compute generalized-energy and scalar-variance dissipation from hyperviscosity
         
         Returns spectral dissipation and flux for both quantities
         """
-        rv_hat = q_hat + self.gamma**2*p_hat
+        tendency = self.hylap*q_hat
+        if self.cl:
+            tendency = tendency + self._compute_leith_term(q_hat)
         # spectral energy transfer of viscosity
-        tevisc = -cp.real(cp.conj(p_hat)*(self.hylap*rv_hat+self._compute_leith_term(rv_hat)))
-        # spectral enstrophy transfer of viscosity
-        tzvisc = cp.real(cp.conj(q_hat)*(self.hylap*rv_hat+self._compute_leith_term(rv_hat)))
+        tevisc = -cp.real(cp.conj(p_hat)*tendency)
+        # spectral scalar-variance transfer of viscosity
+        tqvisc = cp.real(cp.conj(q_hat)*tendency)
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer of viscosity
         # In physical space using spectral aggregation
         tevisc_kk = npg.aggregate(self.kk_idx.ravel().get(),tevisc.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer of viscosity
+        # Isotropic spectrum of scalar variance transfer of viscosity
         # In physical space 
-        tzvisc_kk = npg.aggregate(self.kk_idx.ravel().get(),tzvisc.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        tqvisc_kk = npg.aggregate(self.kk_idx.ravel().get(),tqvisc.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of energy flux of viscosity
         fevisc_kk = np.cumsum(tevisc_kk[::-1])[::-1]
-        # Isotropic spectrum of enstrophy flux of viscosity
-        fzvisc_kk = np.cumsum(tzvisc_kk[::-1])[::-1]
-        return tevisc_kk, tzvisc_kk, fevisc_kk, fzvisc_kk
+        # Isotropic spectrum of scalar variance flux of viscosity
+        fqvisc_kk = np.cumsum(tqvisc_kk[::-1])[::-1]
+        return tevisc_kk, tqvisc_kk, fevisc_kk, fqvisc_kk
 
     def get_diagFilt(self,p_hat,q_hat):
         """Compute energy and enstrophy loss from spectral filter
@@ -783,22 +1019,67 @@ class QGModel:
         filt_rate = (self.filtr - 1.) / self.dt
         # spectral energy transfer of filter
         tefilt = -cp.real(cp.conj(p_hat) * filt_rate*q_hat)
-        # spectral enstrophy transfer of filter
-        tzfilt = cp.real(cp.conj(q_hat) * filt_rate*q_hat)
+        # spectral scalar-variance transfer of filter
+        tqfilt = cp.real(cp.conj(q_hat) * filt_rate*q_hat)
         norm_fac = 1/(self.Nx*self.Ny)
         # Isotropic spectrum of energy transfer of filter
         # In physical space using spectral aggregation
         tefilt_kk = npg.aggregate(self.kk_idx.ravel().get(),tefilt.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
-        # Isotropic spectrum of enstrophy transfer of filter
+        # Isotropic spectrum of scalar variance transfer of filter
         # In physical space 
-        tzfilt_kk = npg.aggregate(self.kk_idx.ravel().get(),tzfilt.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
+        tqfilt_kk = npg.aggregate(self.kk_idx.ravel().get(),tqfilt.ravel().get(),func='sum')[self.kk_range.get()] * norm_fac
         # Isotropic spectrum of energy flux of filter
         fefilt_kk = np.cumsum(tefilt_kk[::-1])[::-1]
-        # Isotropic spectrum of enstrophy flux of filter
-        fzfilt_kk = np.cumsum(tzfilt_kk[::-1])[::-1]
-        return tefilt_kk, tzfilt_kk, fefilt_kk, fzfilt_kk 
+        # Isotropic spectrum of scalar variance flux of filter
+        fqfilt_kk = np.cumsum(tqfilt_kk[::-1])[::-1]
+        return tefilt_kk, tqfilt_kk, fefilt_kk, fqfilt_kk
     
     # Save and output methods
+    def _forcing_metadata(self):
+        """Record only parameters that affect the selected forcing."""
+        metadata = {'forcing_scheme': self.forcing or 'external',
+                    'forcing_norm': self.forcing_norm or 'legacy'}
+        if self.forcing is not None:
+            metadata['forcing_fscale'] = float(self.fscale)
+        if (self.forcing_norm == 'amplitude' or self.forcing in ('markov', 'psi_kflow')
+                or (self.forcing_norm is None and self.forcing == 'wind')):
+            metadata['forcing_famp'] = float(self.famp)
+        if self.forcing == 'psi_kflow':
+            metadata['forcing_variable'] = 'psi'
+            metadata['forcing_amplitude_definition'] = 'peak of Fpsi=famp*sin(fscale*y)'
+        if self.forcing_norm in ('enstrophy', 'energy', 'kinetic_energy'):
+            metadata['forcing_finput'] = float(self.finput)
+        return metadata
+
+    def _validate_model_metadata(self, ds):
+        """Legacy files without alpha/damping metadata describe alpha=2 QG."""
+        for name, default in (('alpha', 2.), ('gamma', self.gamma), ('beta', self.beta)):
+            if float(getattr(ds, name, default)) != float(getattr(self, name)):
+                raise ValueError(f'File {name} does not match this model; use a new output directory.')
+        old_damping = getattr(ds, 'damping_on', 'vorticity')
+        if old_damping != 'q' and not (old_damping == 'vorticity' and self.alpha == 2 and self.gamma == 0):
+            raise ValueError('File damping differs from q damping; use a new output directory.')
+        for name, value in self._forcing_metadata().items():
+            # Old files have no forcing metadata: retain legacy append behavior
+            # but do not append a newly normalized run to an unlabelled file.
+            default = 'legacy' if name == 'forcing_norm' else value
+            if self.forcing == 'psi_kflow':
+                default = None  # New forcing requires explicit matching metadata.
+            if getattr(ds, name, default) != value:
+                raise ValueError(f'File {name} does not match this model; use a new output directory.')
+
+    def _write_model_metadata(self, ds):
+        ds.alpha = self.alpha
+        ds.damping_on = 'q'
+        ds.inversion_definition = 'q_hat=-(k^2+gamma^2)^(alpha/2)*psi_hat; psi_hat[0,0]=0'
+        ds.beta_definition = 'Uniform background q gradient; planetary beta only for alpha=2 QG'
+        ds.gamma_definition = 'Inverse screening length; alpha!=2 extension is a model choice'
+        ds.diagnostic_normalization = 'Grid sums in retained isotropic shells; divide by Nx*Ny for means'
+        ds.energy_definition = 'E=-<psi*q>/2, Q=<q^2>/2, Z=<omega^2>/2, K=<|grad psi|^2>/2, before grid-sum scaling; omega=Delta psi'
+        for name, value in self._forcing_metadata().items():
+            setattr(ds, name, value)
+        ds.forcing_normalization_definition = 'Explicit normalization uses full-grid spatial means'
+
     def create_rst(self,nf,prefix='rst'):
         """Create NetCDF file for model state restart data
         
@@ -814,6 +1095,11 @@ class QGModel:
         if os.path.exists(nc_filename):
             # Append to existing file (auto_complex so 'qrst' reads/writes as complex)
             self.rstds = nc.Dataset(nc_filename, 'a', format='NETCDF4', auto_complex=True)
+            try:
+                self._validate_model_metadata(self.rstds)
+            except ValueError:
+                self.rstds.close()
+                raise
             self.rst_times = self.rstds.variables['time']
             self.qrst_var = self.rstds.variables['qrst']
             # Guard against silently mixing precisions in one restart file
@@ -873,6 +1159,7 @@ class QGModel:
             self.rstds.beta = self.beta
             self.rstds.cl = self.cl
             # self.rst_time_offset = 0
+        self._write_model_metadata(self.rstds)
 
     def create_nc(self,nf,prefix='output'):
         """Create NetCDF file for output diagnostics
@@ -890,40 +1177,70 @@ class QGModel:
         if os.path.exists(nc_filename):
             # Append to existing file
             self.ds = nc.Dataset(nc_filename, 'a', format='NETCDF4')
+            try:
+                self._validate_model_metadata(self.ds)
+            except ValueError:
+                self.ds.close()
+                raise
+            # Old Z/tz/fz outputs describe q, not relative vorticity.
+            # Rename them before creating the distinct relative-vorticity Z outputs.
+            scalar_names = [('Ztot', 'Qtot'), ('Zk', 'Qk')]
+            for term in ('nlk', 'fk', 'frick', 'visck', 'filtk', 'dak'):
+                scalar_names.extend((('tz' + term, 'tq' + term),
+                                     ('fz' + term, 'fq' + term)))
+            for old, new in scalar_names:
+                if old in self.ds.variables and new not in self.ds.variables:
+                    self.ds.renameVariable(old, new)
             self.times = self.ds.variables['time']
             self.q_var = self.ds.variables['q']
             self.psi_var = self.ds.variables['psi']
             self.rv_var = self.ds.variables['rv']
             self.Etot_var = self.ds.variables['Etot']
+            self.Qtot_var = self.ds.variables['Qtot']
+            if 'Ztot' not in self.ds.variables:
+                self.ds.createVariable('Ztot', 'f4', ('time',))
             self.Ztot_var = self.ds.variables['Ztot']
+            if 'sigma' not in self.ds.variables:
+                self.ds.createVariable('sigma', 'f4', ('time', 'k'))
+            self.sigma_var = self.ds.variables['sigma']
+            # Older files acquire K diagnostics; previous records remain missing.
+            if 'Ktot' not in self.ds.variables:
+                self.ds.createVariable('Ktot', 'f4', ('time',))
+            self.Ktot_var = self.ds.variables['Ktot']
             self.Ek_var = self.ds.variables['Ek']
+            self.Qk_var = self.ds.variables['Qk']
+            if 'Zk' not in self.ds.variables:
+                self.ds.createVariable('Zk', 'f4', ('time', 'k'))
             self.Zk_var = self.ds.variables['Zk']
+            if 'Kk' not in self.ds.variables:
+                self.ds.createVariable('Kk', 'f4', ('time', 'k'))
+            self.Kk_var = self.ds.variables['Kk']
             self.tenlk_var = self.ds.variables['tenlk']
-            self.tznlk_var = self.ds.variables['tznlk']
+            self.tqnlk_var = self.ds.variables['tqnlk']
             self.tefk_var = self.ds.variables['tefk']
-            self.tzfk_var = self.ds.variables['tzfk']
+            self.tqfk_var = self.ds.variables['tqfk']
             self.tefrick_var = self.ds.variables['tefrick']
-            self.tzfrick_var = self.ds.variables['tzfrick']
+            self.tqfrick_var = self.ds.variables['tqfrick']
             self.tevisck_var = self.ds.variables['tevisck']
-            self.tzvisck_var = self.ds.variables['tzvisck']
+            self.tqvisck_var = self.ds.variables['tqvisck']
             self.tefiltk_var = self.ds.variables['tefiltk']
-            self.tzfiltk_var = self.ds.variables['tzfiltk']
+            self.tqfiltk_var = self.ds.variables['tqfiltk']
             self.fenlk_var = self.ds.variables['fenlk']
-            self.fznlk_var = self.ds.variables['fznlk']
+            self.fqnlk_var = self.ds.variables['fqnlk']
             self.fefk_var = self.ds.variables['fefk']
-            self.fzfk_var = self.ds.variables['fzfk']
+            self.fqfk_var = self.ds.variables['fqfk']
             self.fefrick_var = self.ds.variables['fefrick']
-            self.fzfrick_var = self.ds.variables['fzfrick']
+            self.fqfrick_var = self.ds.variables['fqfrick']
             self.fevisck_var = self.ds.variables['fevisck']
-            self.fzvisck_var = self.ds.variables['fzvisck']
+            self.fqvisck_var = self.ds.variables['fqvisck']
             self.fefiltk_var = self.ds.variables['fefiltk']
-            self.fzfiltk_var = self.ds.variables['fzfiltk']
+            self.fqfiltk_var = self.ds.variables['fqfiltk']
             
             self.daF_var = self.ds.variables['daF']
             self.tedak_var = self.ds.variables['tedak']
-            self.tzdak_var = self.ds.variables['tzdak']
+            self.tqdak_var = self.ds.variables['tqdak']
             self.fedak_var = self.ds.variables['fedak']
-            self.fzdak_var = self.ds.variables['fzdak']
+            self.fqdak_var = self.ds.variables['fqdak']
         else:
             # Create new file
             self.ds = nc.Dataset(nc_filename, 'w', format='NETCDF4')
@@ -946,50 +1263,54 @@ class QGModel:
             self.q_var = self.ds.createVariable('q', 'f4', ('time', 'y', 'x'), zlib=False)
             self.psi_var = self.ds.createVariable('psi', 'f4', ('time', 'y', 'x'), zlib=False)
             self.rv_var = self.ds.createVariable('rv', 'f4', ('time', 'y', 'x'), zlib=False)
-            ## diagonistic variable
-            ## invariant quantities
+            ## generalized energy, scalar mean square, relative-vorticity enstrophy and deformation
             self.Etot_var = self.ds.createVariable('Etot', 'f4', ('time',))
+            self.Qtot_var = self.ds.createVariable('Qtot', 'f4', ('time',))
             self.Ztot_var = self.ds.createVariable('Ztot', 'f4', ('time',))
+            self.sigma_var = self.ds.createVariable('sigma', 'f4', ('time', 'k'))
+            self.Ktot_var = self.ds.createVariable('Ktot', 'f4', ('time',))
             self.Ek_var = self.ds.createVariable('Ek', 'f4', ('time', 'k'), zlib=False)
+            self.Qk_var = self.ds.createVariable('Qk', 'f4', ('time', 'k'), zlib=False)
             self.Zk_var = self.ds.createVariable('Zk', 'f4', ('time', 'k'), zlib=False)
+            self.Kk_var = self.ds.createVariable('Kk', 'f4', ('time', 'k'), zlib=False)
             ## tendency budget
             # non-linear advection
             self.tenlk_var = self.ds.createVariable('tenlk', 'f4', ('time', 'k'), zlib=False)
-            self.tznlk_var = self.ds.createVariable('tznlk', 'f4', ('time', 'k'), zlib=False)
+            self.tqnlk_var = self.ds.createVariable('tqnlk', 'f4', ('time', 'k'), zlib=False)
             # forcing 
             self.tefk_var = self.ds.createVariable('tefk', 'f4', ('time', 'k'), zlib=False)
-            self.tzfk_var = self.ds.createVariable('tzfk', 'f4', ('time', 'k'), zlib=False)
+            self.tqfk_var = self.ds.createVariable('tqfk', 'f4', ('time', 'k'), zlib=False)
             # friction
             self.tefrick_var = self.ds.createVariable('tefrick', 'f4', ('time', 'k'), zlib=False)
-            self.tzfrick_var = self.ds.createVariable('tzfrick', 'f4', ('time', 'k'), zlib=False)
+            self.tqfrick_var = self.ds.createVariable('tqfrick', 'f4', ('time', 'k'), zlib=False)
             # viscosity
             self.tevisck_var = self.ds.createVariable('tevisck', 'f4', ('time', 'k'), zlib=False)
-            self.tzvisck_var = self.ds.createVariable('tzvisck', 'f4', ('time', 'k'), zlib=False)
+            self.tqvisck_var = self.ds.createVariable('tqvisck', 'f4', ('time', 'k'), zlib=False)
             # filter
             self.tefiltk_var = self.ds.createVariable('tefiltk', 'f4', ('time', 'k'), zlib=False)
-            self.tzfiltk_var = self.ds.createVariable('tzfiltk', 'f4', ('time', 'k'), zlib=False)
+            self.tqfiltk_var = self.ds.createVariable('tqfiltk', 'f4', ('time', 'k'), zlib=False)
             ## flux budget
             # non-linear advection
             self.fenlk_var = self.ds.createVariable('fenlk', 'f4', ('time', 'k'), zlib=False)
-            self.fznlk_var = self.ds.createVariable('fznlk', 'f4', ('time', 'k'), zlib=False)
+            self.fqnlk_var = self.ds.createVariable('fqnlk', 'f4', ('time', 'k'), zlib=False)
             # forcing 
             self.fefk_var = self.ds.createVariable('fefk', 'f4', ('time', 'k'), zlib=False)
-            self.fzfk_var = self.ds.createVariable('fzfk', 'f4', ('time', 'k'), zlib=False)
+            self.fqfk_var = self.ds.createVariable('fqfk', 'f4', ('time', 'k'), zlib=False)
             # friction
             self.fefrick_var = self.ds.createVariable('fefrick', 'f4', ('time', 'k'), zlib=False)
-            self.fzfrick_var = self.ds.createVariable('fzfrick', 'f4', ('time', 'k'), zlib=False)
+            self.fqfrick_var = self.ds.createVariable('fqfrick', 'f4', ('time', 'k'), zlib=False)
             # viscosity
             self.fevisck_var = self.ds.createVariable('fevisck', 'f4', ('time', 'k'), zlib=False)
-            self.fzvisck_var = self.ds.createVariable('fzvisck', 'f4', ('time', 'k'), zlib=False)
+            self.fqvisck_var = self.ds.createVariable('fqvisck', 'f4', ('time', 'k'), zlib=False)
             # filter
             self.fefiltk_var = self.ds.createVariable('fefiltk', 'f4', ('time', 'k'), zlib=False)
-            self.fzfiltk_var = self.ds.createVariable('fzfiltk', 'f4', ('time', 'k'), zlib=False)
+            self.fqfiltk_var = self.ds.createVariable('fqfiltk', 'f4', ('time', 'k'), zlib=False)
 
             self.daF_var = self.ds.createVariable('daF', 'f4', ('time', 'y', 'x'), zlib=False)
             self.tedak_var = self.ds.createVariable('tedak', 'f4', ('time', 'k'), zlib=False)
-            self.tzdak_var = self.ds.createVariable('tzdak', 'f4', ('time', 'k'), zlib=False)
+            self.tqdak_var = self.ds.createVariable('tqdak', 'f4', ('time', 'k'), zlib=False)
             self.fedak_var = self.ds.createVariable('fedak', 'f4', ('time', 'k'), zlib=False)
-            self.fzdak_var = self.ds.createVariable('fzdak', 'f4', ('time', 'k'), zlib=False)
+            self.fqdak_var = self.ds.createVariable('fqdak', 'f4', ('time', 'k'), zlib=False)
 
             self.ds.description = "QG Turbulence Simulation"
             self.ds.dt = self.dt
@@ -1006,6 +1327,16 @@ class QGModel:
             self.ds.beta = self.beta
             self.ds.cl = self.cl
             # self.nc_time_offset = 0
+        self._write_model_metadata(self.ds)
+        for var in (self.Ktot_var, self.Kk_var):
+            var.long_name = 'Kinetic energy in legacy grid-sum shell normalization'
+            var.units = '1'
+        for name in ('Qtot', 'Qk'):
+            self.ds[name].long_name = 'Half active-scalar mean square in grid-sum shell normalization'
+        for name in ('Ztot', 'Zk'):
+            self.ds[name].long_name = 'Relative-vorticity enstrophy in grid-sum shell normalization'
+        self.sigma_var.long_name = 'Cumulative deformation rate sqrt(cumsum(Zk)/(Nx*Ny))'
+        self.sigma_var.units = '1/time'
 
     def save_rst(self,it):
         """Save model state to restart file for integration continuation
@@ -1041,11 +1372,12 @@ class QGModel:
     def save_var(self,it):
         """Save diagnostic variables to output file
         
-        Computes and stores spectral energy/enstrophy and all budget terms
+        Computes and stores spectral energy/scalar-variance and all budget terms
         
         Args:
             it: Output record number index
         """
+        self.force_q = self._forcing_at_state(self.q_hat, self.p_hat, self.t)
         # Transform prognostic fields to physical space
         p_r = ifft2(self.p_hat).real.get()
         q_r = ifft2(self.q_hat).real.get()
@@ -1057,27 +1389,33 @@ class QGModel:
         self.psi_var[it,:,:] = p_r
         self.rv_var[it,:,:] = rv_r
         # Store diagnostic variables
-        # Energy and enstrophy total quantities
+        # Energy, scalar mean square and relative-vorticity enstrophy
         self.Etot_var[it] = self.get_Etot(self.p_hat)
-        self.Ztot_var[it] = self.get_Ztot(self.q_hat)
+        self.Qtot_var[it] = self.get_Qtot(self.q_hat)
+        z_kk = self.get_Zk(self.rv_hat)
+        self.Ztot_var[it] = np.sum(z_kk)
+        self.sigma_var[it,:] = self.get_sigma(z_kk)
         self.Ek_var[it,:] = self.get_Ek(self.p_hat) 
-        self.Zk_var[it,:] = self.get_Zk(self.q_hat) 
-        # Energy and enstrophy budget terms
+        self.Qk_var[it,:] = self.get_Qk(self.q_hat)
+        self.Zk_var[it,:] = z_kk
+        self.Ktot_var[it] = self.get_Ktot(self.p_hat)
+        self.Kk_var[it,:] = self.get_Kk(self.p_hat)
+        # Generalized-energy and scalar-variance budget terms
         # Non-linear advection transfer and flux
-        self.tenlk_var[it,:],self.tznlk_var[it,:], self.fenlk_var[it,:], self.fznlk_var[it,:] = self.get_diagNL(self.p_hat,self.q_hat)
+        self.tenlk_var[it,:],self.tqnlk_var[it,:], self.fenlk_var[it,:], self.fqnlk_var[it,:] = self.get_diagNL(self.p_hat,self.q_hat)
         # Forcing transfer and flux
-        self.tefk_var[it,:], self.tzfk_var[it,:], self.fefk_var[it,:], self.fzfk_var[it,:] = self.get_diagF(self.p_hat,self.q_hat,self.force_q)
+        self.tefk_var[it,:], self.tqfk_var[it,:], self.fefk_var[it,:], self.fqfk_var[it,:] = self.get_diagF(self.p_hat,self.q_hat,self.force_q)
         # Friction dissipation and flux
-        self.tefrick_var[it,:], self.tzfrick_var[it,:],self.fefrick_var[it,:], self.fzfrick_var[it,:] = self.get_diagFric(self.p_hat,self.q_hat)
+        self.tefrick_var[it,:], self.tqfrick_var[it,:],self.fefrick_var[it,:], self.fqfrick_var[it,:] = self.get_diagFric(self.p_hat,self.q_hat)
         # Hyperviscosity dissipation and flux
-        self.tevisck_var[it,:], self.tzvisck_var[it,:], self.fevisck_var[it,:], self.fzvisck_var[it,:] = self.get_diagVisc(self.p_hat,self.q_hat)
+        self.tevisck_var[it,:], self.tqvisck_var[it,:], self.fevisck_var[it,:], self.fqvisck_var[it,:] = self.get_diagVisc(self.p_hat,self.q_hat)
         # Spectral filter loss and flux
-        self.tefiltk_var[it,:], self.tzfiltk_var[it,:],self.fefiltk_var[it,:], self.fzfiltk_var[it,:] = self.get_diagFilt(self.p_hat,self.q_hat)
+        self.tefiltk_var[it,:], self.tqfiltk_var[it,:],self.fefiltk_var[it,:], self.fqfiltk_var[it,:] = self.get_diagFilt(self.p_hat,self.q_hat)
 
         # Save DA term
         self.daF_var[it, :, :] = ifft2(self.da_term).real.get()
         # Save DA diagnostics
-        self.tedak_var[it,:], self.tzdak_var[it,:], self.fedak_var[it,:], self.fzdak_var[it,:] = self.get_diagDa(self.p_hat, self.q_hat, self.da_term)
+        self.tedak_var[it,:], self.tqdak_var[it,:], self.fedak_var[it,:], self.fqdak_var[it,:] = self.get_diagDa(self.p_hat, self.q_hat, self.da_term)
 
         # Flush to disk
         self.ds.sync()
@@ -1093,6 +1431,7 @@ class QGModel:
         Args:
             save_path: Optional path to save figure
         """
+        self.force_q = self._forcing_at_state(self.q_hat, self.p_hat, self.t)
         # Compute all diagnostic budget terms
         Ek = self.get_Ek(self.p_hat)
         
@@ -1157,11 +1496,11 @@ class QGModel:
         q_phys = ifft2(self.q_hat).real.get()
         im = ax_pv.imshow(q_phys, cmap=self.my_div,vmin=-10,vmax=10,
                           extent=[0, self.Lx, 0, self.Ly])
-        ax_pv.set_title(f'Potential Vorticity (t={self.t:.2f})', fontsize=30, fontweight='bold')
+        ax_pv.set_title(f'Active scalar q (alpha={self.alpha:g}, t={self.t:.2f})', fontsize=30, fontweight='bold')
         ax_pv.set_xlabel('x')
         ax_pv.set_ylabel('y')
         cbar = fig.colorbar(im, ax=ax_pv, shrink=0.8, aspect=30, pad=0.02)
-        cbar.set_label('PV')
+        cbar.set_label('q')
 
         # Common Wavenumber Axis 
         ks = self.kk_iso.get() /(2*cp.pi/self.Lx)
@@ -1172,10 +1511,11 @@ class QGModel:
         ks_direct = np.array([18., 80.]) /(2*cp.pi/self.Lx)
         ks_inv = np.array([5., 16.]) /(2*cp.pi/self.Lx)
         ax_spec.axvline(self.fscale/(2*cp.pi/self.Lx), color='k', linestyle='--', linewidth=1.5, alpha=0.5)
-        ax_spec.loglog(ks_direct, 0.5 * ks_direct**-3, 'k--', label='$k^{-3}$', alpha=0.6)
-        ax_spec.loglog(ks_inv, 0.1 * ks_inv**-(5/3), 'k-.', label='$k^{-5/3}$', alpha=0.6)
+        if self.alpha == 2 and self.gamma == 0:
+            ax_spec.loglog(ks_direct, 0.5 * ks_direct**-3, 'k--', label='$k^{-3}$', alpha=0.6)
+            ax_spec.loglog(ks_inv, 0.1 * ks_inv**-(5/3), 'k-.', label='$k^{-5/3}$', alpha=0.6)
         
-        ax_spec.set_title('Isotropic KE Spectrum', fontweight='bold')
+        ax_spec.set_title('Generalized energy spectrum', fontweight='bold')
         ax_spec.set_xlabel('Wavenumber $k$')
         ax_spec.set_ylabel('$E(k)$')
         ax_spec.set_xlim([1, int(self.Nx/2)])
